@@ -1,109 +1,96 @@
-#include "ns3/core-module.h"
-#include "ns3/network-module.h"
-#include "ns3/mobility-module.h"
-#include "ns3/internet-module.h"
-#include "ns3/wifi-module.h"
-#include "ns3/applications-module.h"
-#include "ns3/etx-olsr-helper.h" // 引入etx-olsr模块的Helper头文件
+#include <iostream>
+#include <ns3/core-module.h>
+#include <ns3/network-module.h>
+#include <ns3/internet-module.h>
+#include <ns3/olsr-helper.h>
+#include <ns3/yans-wifi-channel.h>
+#include <ns3/wifi-module.h>
+#include <ns3/flow-monitor-module.h>
+#include <ns3/gauss-markov-mobility-model.h>
+#include <ns3/udp-socket-factory.h>
+#include <ns3/onoff-application.h>
+#include <ns3/log.h>
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("MainSimulation");
+NS_LOG_COMPONENT_DEFINE ("AntiDroneSimulation");
 
-int main(int argc, char *argv[])
+void EnableJammer(Ptr<Node> jammerNode, double startTime, double stopTime)
 {
-  // 参数配置
-  uint32_t numNodes = 50;   // 设置正常节点数为50
-  uint32_t numJammers = 5;  // 干扰节点数
-  double simTime = 60.0;    // 仿真时长为60秒
-  double areaSize = 500.0;  // 仿真区域大小为500x500米
+    Ptr<OnOffApplication> app = CreateObject<OnOffApplication>();
+    app->SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1]"));
+    app->SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0]"));
+    app->SetAttribute ("DataRate", StringValue ("1000bps"));
+    app->SetAttribute ("Remote", AddressValue (InetSocketAddress (InetSocketAddress::GetBroadcast (), 9)));
+    jammerNode->AddApplication (app);
+    app->SetStartTime(Seconds(startTime));
+    app->SetStopTime(Seconds(stopTime));
+}
 
-  CommandLine cmd;
-  cmd.AddValue("numNodes", "Number of normal nodes", numNodes);
-  cmd.AddValue("numJammers", "Number of jamming nodes", numJammers);
-  cmd.AddValue("simTime", "Simulation time in seconds", simTime);
-  cmd.Parse(argc, argv);
+int main (int argc, char *argv[])
+{
+    CommandLine cmd;
+    double stopTime = 100.0;
+    bool enableJammer = false;
+    cmd.AddValue ("stopTime", "Simulation stop time", stopTime);
+    cmd.AddValue ("enableJammer", "Enable jammer (true/false)", enableJammer);
+    cmd.Parse (argc, argv);
 
-  // 创建仿真节点
-  NodeContainer normalNodes;
-  normalNodes.Create(numNodes);
-  NodeContainer jammingNodes;
-  jammingNodes.Create(numJammers);
+    NodeContainer nodes;
+    nodes.Create (51); // 50 nodes + 1 jammer
 
-  // 配置节点的移动模型
-  MobilityHelper mobility;
-  mobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                "MinX", DoubleValue(0.0),
-                                "MinY", DoubleValue(0.0),
-                                "DeltaX", DoubleValue(20.0),
-                                "DeltaY", DoubleValue(20.0),
-                                "GridWidth", UintegerValue(10),
-                                "LayoutType", StringValue("RowFirst"));
-  mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-  mobility.Install(normalNodes);
-  mobility.Install(jammingNodes);
+    YansWifiChannelHelper channel = YansWifiChannelHelper::Default ();
+    YansWifiPhyHelper phy = YansWifiPhyHelper::Default ();
+    phy.SetChannel (channel.Create ());
 
-  // 配置WiFi物理层与通道
-  WifiHelper wifi;
-  wifi.SetStandard(WIFI_PHY_STANDARD_80211a);
+    WifiHelper wifi;
+    wifi.SetStandard (WIFI_STANDARD_802_11g);
+    wifi.SetRemoteStationManager ("ns3::ConstantRateManager");
 
-  YansWifiPhyHelper wifiPhy = YansWifiPhyHelper::Default();
-  wifiPhy.Set("RxGain", DoubleValue(-10));
-  wifiPhy.Set("TxGain", DoubleValue(5));  // 模拟干扰
-  wifiPhy.Set("ChannelNumber", UintegerValue(6));
+    WifiMacHelper mac;
+    mac.SetType ("ns3::AdhocWifiMac");
+    NetDeviceContainer devices = wifi.Install (phy.Create (), mac.Create (nodes));
 
-  YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default();
-  wifiPhy.SetChannel(wifiChannel.Create());
+    InternetStackHelper internet;
+    internet.Install (nodes);
 
-  // MAC层和SSID
-  WifiMacHelper wifiMac;
-  Ssid ssid = Ssid("ETX-OLSR-Network");
-  wifiMac.SetType("ns3::AdhocWifiMac");
+    OlsrHelper olsr;
+    Ipv4ListRoutingHelper list;
+    list.Add(olsr, 10);
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
 
-  // 安装网络
-  NetDeviceContainer normalDevices = wifi.Install(wifiPhy, wifiMac, normalNodes);
-  NetDeviceContainer jammerDevices = wifi.Install(wifiPhy, wifiMac, jammingNodes);
+    MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::GaussMarkovMobilityModel");
+    mobility.Install(nodes.Get(0, 49)); // normal nodes
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(nodes.Get(50)); // jammer node
 
-  // 配置协议栈与ETX-OLSR
-  InternetStackHelper internet;
-  EtxOlsrHelper etxOlsr; // 使用自定义的EtxOlsrHelper
-  internet.SetRoutingHelper(etxOlsr); // 替换默认的路由协议
-  internet.Install(normalNodes);
-  internet.Install(jammingNodes);
+    if (enableJammer)
+    {
+        EnableJammer(nodes.Get(50), 20.0, 80.0);
+        NS_LOG_INFO("Jammer enabled");
+    }
 
-  // 为普通节点创建IP地址
-  Ipv4AddressHelper ipv4;
-  ipv4.SetBase("10.0.0.0", "255.255.255.0");
-  Ipv4InterfaceContainer normalInterfaces = ipv4.Assign(normalDevices);
-  Ipv4InterfaceContainer jammerInterfaces = ipv4.Assign(jammerDevices);
+    // Create a UDP flow from node 10 to node 0
+    uint16_t port = 9;
+    UdpSocketFactoryImpl socket;
+    Ptr<Socket> sinkSocket = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sinkSocket->Bind(InetSocketAddress (Ipv4Address::GetAny(), port));
+    sinkSocket->SetRecvCallback(MakeCallback(&ReceivePacket));
 
-  // 应用层：普通流量
-  uint16_t port = 4000;
-  UdpServerHelper udpServer(port);
-  ApplicationContainer serverApps = udpServer.Install(normalNodes.Get(0));
-  serverApps.Start(Seconds(1.0));
-  serverApps.Stop(Seconds(simTime));
+    Ptr<Socket> sourceSocket = Socket::CreateSocket(nodes.Get(10), UdpSocketFactory::GetTypeId());
+    sourceSocket->Connect(InetSocketAddress(sinkAddress, port));
+    sourceSocket->SetStartTime(Seconds(12));
+    sourceSocket->SetStopTime(Seconds(stopTime - 1));
 
-  UdpClientHelper udpClient(normalInterfaces.GetAddress(0), port);
-  udpClient.SetAttribute("MaxPackets", UintegerValue(1000));
-  udpClient.SetAttribute("Interval", TimeValue(Seconds(0.1)));
-  udpClient.SetAttribute("PacketSize", UintegerValue(512));
+    // Flow Monitor
+    FlowMonitorHelper flowMonitor;
+    Ptr<FlowMonitor> monitor = flowMonitor.InstallAll();
 
-  ApplicationContainer clientApps = udpClient.Install(normalNodes.Get(numNodes - 1));
-  clientApps.Start(Seconds(2.0));
-  clientApps.Stop(Seconds(simTime));
+    Simulator::Stop(Seconds(stopTime));
+    Simulator::Run();
 
-  // 应用层：干扰流量
-  OnOffHelper jammer("ns3::UdpSocketFactory", Address(Ipv4Address::GetBroadcast()));
-  jammer.SetConstantRate(DataRate("2Mbps"));
-  ApplicationContainer jammerApps = jammer.Install(jammingNodes);
-  jammerApps.Start(Seconds(3.0));
-  jammerApps.Stop(Seconds(simTime));
-
-  // 启动仿真
-  Simulator::Stop(Seconds(simTime));
-  Simulator::Run();
-  Simulator::Destroy();
-
-  return 0;
+    monitor->SerializeToXmlFile("flow-monitor.xml", true, true);
+    Simulator::Destroy();
+    return 0;
 }
