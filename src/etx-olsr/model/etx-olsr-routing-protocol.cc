@@ -137,6 +137,19 @@ RoutingProtocol::GetTypeId()
                         DoubleValue(3.0),
                         MakeDoubleAccessor(&RoutingProtocol::m_initialEtx),
                         MakeDoubleChecker<double>(1.0))
+          .AddAttribute("RiskBeta",
+                        "EWMA smoothing factor β for per-next-hop variance (σ²) update. "
+                        "Range [0,1]: 0 freezes variance at its initial value of 0 "
+                        "(effectively disables risk-aware selection), 1 uses only the "
+                        "most-recent squared error.",
+                        DoubleValue(0.3),
+                        MakeDoubleAccessor(&RoutingProtocol::m_beta),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("RiskLambda",
+                        "Risk weight λ used in candidate scoring: score = V̂ + λ·σ.",
+                        DoubleValue(1.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_lambda),
+                        MakeDoubleChecker<double>(0.0))
           .AddTraceSource("Rx",
                           "Receive ETX-OLSR packet.",
                           MakeTraceSourceAccessor(&RoutingProtocol::m_rxPacketTrace),
@@ -161,7 +174,9 @@ RoutingProtocol::RoutingProtocol()
       m_hnaTimer(Timer::CANCEL_ON_DESTROY),
       m_queuedMessagesTimer(Timer::CANCEL_ON_DESTROY),
       m_etxAlpha(0.7),
-      m_initialEtx(3.0)
+      m_initialEtx(3.0),
+      m_beta(0.3),
+      m_lambda(1.0)
 {
   m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
   m_hnaRoutingTable = Create<Ipv4StaticRouting>();
@@ -220,6 +235,8 @@ RoutingProtocol::DoDispose()
   m_table.clear();
   m_candidateTable.clear();
   m_etxMap.clear();
+  m_sigma.clear();
+  m_prevCandCost.clear();
 
   Ipv4RoutingProtocol::DoDispose();
 }
@@ -1031,69 +1048,52 @@ RoutingProtocol::RoutingTableComputation()
                   << " primary=" << cset[0].nextHop
                   << " backup=" << cset[1].nextHop);
   }
+
+  // ---- Risk-aware: update per-next-hop variance σ² (Control-Plane timescale) ----
+  // For every candidate next-hop that appears in the table, compare the current
+  // path-cost estimate (V̂) against the previously stored value.  The squared
+  // prediction error drives an EWMA variance estimate:
+  //   e  = ctrlCost_now - ctrlCost_prev
+  //   σ² ← (1-β)·σ² + β·e²
+  for (const auto& kv : m_candidateTable)
+  {
+    const CandidateSet& cset = kv.second;
+    for (std::size_t k = 0; k < cset.size(); k++)
+    {
+      const CandidateRoute& cand = cset[k];
+      if (cand.nextHop == Ipv4Address() || std::isinf(cand.ctrlCost))
+      {
+        continue;
+      }
+
+      auto prevIt = m_prevCandCost.find(cand.nextHop);
+      // On the first observation for a next-hop, prevCost == ctrlCost, so error = 0
+      // and σ² remains at its initial value of 0.  Variance warms up from the second
+      // routing-table computation onwards (cold-start by design).
+      double prevCost = (prevIt != m_prevCandCost.end()) ? prevIt->second : cand.ctrlCost;
+
+      double error = cand.ctrlCost - prevCost;
+      double prevSigma = 0.0;
+      auto sigIt = m_sigma.find(cand.nextHop);
+      if (sigIt != m_sigma.end())
+      {
+        prevSigma = sigIt->second;
+      }
+      double newSigma = (1.0 - m_beta) * prevSigma + m_beta * error * error;
+      m_sigma[cand.nextHop] = newSigma;
+      m_prevCandCost[cand.nextHop] = cand.ctrlCost;
+
+      NS_LOG_DEBUG("Sigma update: nextHop=" << cand.nextHop
+                   << " cost=" << cand.ctrlCost
+                   << " error=" << error
+                   << " sigma=" << std::sqrt(newSigma));
+    }
+  }
   // ---------------- end candidate table ----------------
 
   NS_LOG_DEBUG("Node " << m_mainAddress << ": ETX RoutingTableComputation end. "
                        << GetSize() << " routes.");
   m_routingTableChanged(GetSize());
-}
-
-bool
-RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) const
-{
-  auto it = m_candidateTable.find(dest);
-  if (it == m_candidateTable.end())
-  {
-    return false;
-  }
-
-  const CandidateSet& cset = it->second;
-
-  auto isAvailable = [this](const Ipv4Address& nh) -> bool {
-    if (nh == Ipv4Address())
-    {
-      return false;
-    }
-
-    Time now = Simulator::Now();
-
-    for (const auto& nb : m_state.GetNeighbors())
-    {
-      if (nb.status == olsr::NeighborTuple::STATUS_SYM &&
-          GetMainAddress(nh) == nb.neighborMainAddr)
-      {
-        return true;
-      }
-    }
-
-    for (const auto& link : m_state.GetLinks())
-    {
-      if (GetMainAddress(link.neighborIfaceAddr) == GetMainAddress(nh) &&
-          link.symTime >= now)
-      {
-        return true;
-      }
-    }
-
-    return false;
-  };
-
-  if (isAvailable(cset[0].nextHop))
-  {
-    out = cset[0];
-    NS_LOG_DEBUG("ChooseCandidate: dest=" << dest << " use primary=" << out.nextHop);
-    return true;
-  }
-
-  if (isAvailable(cset[1].nextHop))
-  {
-    out = cset[1];
-    NS_LOG_DEBUG("ChooseCandidate: dest=" << dest << " use backup=" << out.nextHop);
-    return true;
-  }
-
-  NS_LOG_DEBUG("ChooseCandidate: dest=" << dest << " no candidate available");
-  return false;
 }
 
 void
@@ -2139,6 +2139,7 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) c
 
   const CandidateSet& cset = it->second;
 
+  // Helper: true iff next-hop nh has a live symmetric link.
   auto isAvailable = [this](const Ipv4Address& nh) -> bool {
     if (nh == Ipv4Address())
     {
@@ -2168,17 +2169,44 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) c
     return false;
   };
 
-  if (isAvailable(cset[0].nextHop))
+  // Risk-aware scoring (Data-Plane timescale):
+  //   score[a] = V̂[a] + λ · σ[a]
+  // where V̂[a] = ctrlCost and σ[a] = sqrt(m_sigma[a]).
+  // Among all available candidates, select the one with the minimum score.
+  const double inf = std::numeric_limits<double>::infinity();
+  double bestScore = inf;
+  int bestK = -1;
+
+  for (int k = 0; k < static_cast<int>(cset.size()); k++)
   {
-    out = cset[0];
-    NS_LOG_DEBUG("ChooseCandidate: dest=" << dest << " use primary=" << out.nextHop);
-    return true;
+    const CandidateRoute& cand = cset[k];
+    if (!isAvailable(cand.nextHop))
+    {
+      continue;
+    }
+
+    double sigma = 0.0;
+    auto sigIt = m_sigma.find(cand.nextHop);
+    if (sigIt != m_sigma.end())
+    {
+      sigma = std::sqrt(sigIt->second);
+    }
+
+    double score = cand.ctrlCost + m_lambda * sigma;
+    if (score < bestScore)
+    {
+      bestScore = score;
+      bestK = k;
+    }
   }
 
-  if (isAvailable(cset[1].nextHop))
+  if (bestK >= 0)
   {
-    out = cset[1];
-    NS_LOG_DEBUG("ChooseCandidate: dest=" << dest << " use backup=" << out.nextHop);
+    out = cset[bestK];
+    NS_LOG_DEBUG("ChooseCandidate: dest=" << dest
+                 << " k=" << bestK
+                 << " nextHop=" << out.nextHop
+                 << " score=" << bestScore);
     return true;
   }
 

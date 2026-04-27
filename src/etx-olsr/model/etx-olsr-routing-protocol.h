@@ -34,6 +34,7 @@
 #include <map>
 #include <vector>
 #include <limits>
+#include <cmath>
 
 namespace ns3
 {
@@ -156,6 +157,16 @@ private:
   std::map<Ipv4Address, EtxInfo> m_etxMap;
   double m_etxAlpha;
   double m_initialEtx;
+
+  // ---- Risk-aware routing state ----
+  /// Per-next-hop EWMA variance of path-cost prediction error (σ²).
+  std::map<Ipv4Address, double> m_sigma;
+  /// Previous candidate cost through each next-hop, used to compute prediction error.
+  std::map<Ipv4Address, double> m_prevCandCost;
+  /// EWMA smoothing factor β for σ² update (0 < β ≤ 1).
+  double m_beta;
+  /// Risk weight λ: score = V̂ + λ·σ.
+  double m_lambda;
 
   // ---- Phase-1 candidate routing (K=2) ----
   struct CandidateRoute
