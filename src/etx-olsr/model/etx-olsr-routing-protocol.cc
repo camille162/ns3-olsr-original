@@ -150,6 +150,13 @@ RoutingProtocol::GetTypeId()
                         DoubleValue(1.0),
                         MakeDoubleAccessor(&RoutingProtocol::m_lambda),
                         MakeDoubleChecker<double>(0.0))
+          .AddAttribute("MabC",
+                        "UCB1 exploration constant c for MAB-based data-plane candidate "
+                        "selection. score = r̂_a + c·sqrt(ln(t)/N_a). "
+                        "Set to 0 to disable exploration (pure exploitation).",
+                        DoubleValue(1.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_mabC),
+                        MakeDoubleChecker<double>(0.0))
           .AddTraceSource("Rx",
                           "Receive ETX-OLSR packet.",
                           MakeTraceSourceAccessor(&RoutingProtocol::m_rxPacketTrace),
@@ -176,7 +183,9 @@ RoutingProtocol::RoutingProtocol()
       m_etxAlpha(0.7),
       m_initialEtx(3.0),
       m_beta(0.3),
-      m_lambda(1.0)
+      m_lambda(1.0),
+      m_mabTotalDecisions(0),
+      m_mabC(1.0)
 {
   m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
   m_hnaRoutingTable = Create<Ipv4StaticRouting>();
@@ -237,6 +246,7 @@ RoutingProtocol::DoDispose()
   m_etxMap.clear();
   m_sigma.clear();
   m_prevCandCost.clear();
+  m_mabArms.clear();
 
   Ipv4RoutingProtocol::DoDispose();
 }
@@ -1090,6 +1100,51 @@ RoutingProtocol::RoutingTableComputation()
     }
   }
   // ---------------- end candidate table ----------------
+
+  // ---- MAB arm reward update (Control-Plane timescale) ----
+  // For every candidate next-hop in the table, compute the current risk-adjusted
+  // reward and update the MAB arm's mean reward estimate via EWMA:
+  //   reward = -(ctrlCost + λ·σ)      [negative cost = reward we want to maximise]
+  //   r̂_a   ← α·r̂_a + (1-α)·reward  [on subsequent observations]
+  // On cold-start (arm not yet observed) the current reward is used directly.
+  for (const auto& kv : m_candidateTable)
+  {
+    const CandidateSet& cset = kv.second;
+    for (std::size_t k = 0; k < cset.size(); k++)
+    {
+      const CandidateRoute& cand = cset[k];
+      if (cand.nextHop == Ipv4Address() || std::isinf(cand.ctrlCost))
+      {
+        continue;
+      }
+
+      double sigma = 0.0;
+      auto sigIt = m_sigma.find(cand.nextHop);
+      if (sigIt != m_sigma.end())
+      {
+        sigma = std::sqrt(sigIt->second);
+      }
+
+      double reward = -(cand.ctrlCost + m_lambda * sigma);
+
+      MabArm& arm = m_mabArms[cand.nextHop];
+      if (!arm.initialized)
+      {
+        arm.rewardMean = reward;
+        arm.initialized = true;
+      }
+      else
+      {
+        arm.rewardMean = m_etxAlpha * arm.rewardMean + (1.0 - m_etxAlpha) * reward;
+      }
+
+      NS_LOG_DEBUG("MAB reward update: nextHop=" << cand.nextHop
+                   << " reward=" << reward
+                   << " rewardMean=" << arm.rewardMean
+                   << " count=" << arm.count);
+    }
+  }
+  // ---- end MAB arm reward update ----
 
   NS_LOG_DEBUG("Node " << m_mainAddress << ": ETX RoutingTableComputation end. "
                        << GetSize() << " routes.");
@@ -2129,7 +2184,7 @@ RoutingProtocol::FindSendEntry(const RoutingTableEntry& entry, RoutingTableEntry
 }
 
 bool
-RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) const
+RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
 {
   auto it = m_candidateTable.find(dest);
   if (it == m_candidateTable.end())
@@ -2169,13 +2224,23 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) c
     return false;
   };
 
-  // Risk-aware scoring (Data-Plane timescale):
-  //   score[a] = V̂[a] + λ · σ[a]
-  // where V̂[a] = ctrlCost and σ[a] = sqrt(m_sigma[a]).
-  // Among all available candidates, select the one with the minimum score.
-  const double inf = std::numeric_limits<double>::infinity();
-  double bestScore = inf;
+  // MAB (UCB1) selection — Data-Plane timescale.
+  //
+  // Each candidate next-hop is treated as a bandit arm a.
+  // UCB score: score_a = r̂_a + c · sqrt( ln(t) / N_a )
+  //   r̂_a  = mean reward estimate (updated by control-plane EWMA; reward = -risk_cost)
+  //   N_a   = number of times arm a has been selected so far
+  //   t     = total data-plane decisions made so far (+1 to keep ln(t) ≥ 0)
+  //   c     = m_mabC (exploration constant)
+  //
+  // Arms with N_a == 0 receive score = +∞ (always explored before exploitation).
+  // Among arms with the same score, the lower index (primary path) wins.
+
+  const double negInf = -std::numeric_limits<double>::infinity();
+  double bestScore = negInf;
   int bestK = -1;
+
+  uint64_t t = m_mabTotalDecisions + 1; // +1 avoids ln(0)
 
   for (int k = 0; k < static_cast<int>(cset.size()); k++)
   {
@@ -2185,17 +2250,32 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) c
       continue;
     }
 
-    double sigma = 0.0;
-    auto sigIt = m_sigma.find(cand.nextHop);
-    if (sigIt != m_sigma.end())
+    auto armIt = m_mabArms.find(cand.nextHop);
+
+    // Fallback reward estimate for arms the control plane has not yet observed.
+    double rHat = (armIt != m_mabArms.end() && armIt->second.initialized)
+                      ? armIt->second.rewardMean
+                      : -(cand.ctrlCost);
+
+    uint64_t count = (armIt != m_mabArms.end()) ? armIt->second.count : 0;
+
+    double ucbScore;
+    if (count == 0)
     {
-      sigma = std::sqrt(sigIt->second);
+      // Cold-start: give unvisited arms the highest possible priority.
+      ucbScore = std::numeric_limits<double>::infinity();
+    }
+    else
+    {
+      double exploration =
+          m_mabC * std::sqrt(std::log(static_cast<double>(t)) /
+                             static_cast<double>(count));
+      ucbScore = rHat + exploration;
     }
 
-    double score = cand.ctrlCost + m_lambda * sigma;
-    if (score < bestScore)
+    if (ucbScore > bestScore)
     {
-      bestScore = score;
+      bestScore = ucbScore;
       bestK = k;
     }
   }
@@ -2203,10 +2283,25 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) c
   if (bestK >= 0)
   {
     out = cset[bestK];
-    NS_LOG_DEBUG("ChooseCandidate: dest=" << dest
+
+    // Update MAB arm statistics for the selected arm.
+    m_mabTotalDecisions++;
+    MabArm& arm = m_mabArms[out.nextHop];
+    arm.count++;
+    if (!arm.initialized)
+    {
+      // Edge-case: arm reached here without a control-plane update yet.
+      arm.rewardMean = -(out.ctrlCost);
+      arm.initialized = true;
+    }
+
+    NS_LOG_DEBUG("ChooseCandidate (UCB1): dest=" << dest
                  << " k=" << bestK
                  << " nextHop=" << out.nextHop
-                 << " score=" << bestScore);
+                 << " ucbScore=" << bestScore
+                 << " rHat=" << arm.rewardMean
+                 << " count=" << arm.count
+                 << " t=" << m_mabTotalDecisions);
     return true;
   }
 
