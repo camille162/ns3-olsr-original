@@ -185,6 +185,32 @@ private:
   using CandidateSet = std::array<CandidateRoute, 2>;
   std::map<Ipv4Address, CandidateSet> m_candidateTable;
 
+  // ---- MAB (UCB1) state for data-plane arm selection ----
+  /**
+   * Per-arm statistics maintained for the UCB1 algorithm.
+   * Each candidate next-hop constitutes one "arm" of the bandit.
+   */
+  struct MabArm
+  {
+    double rewardMean;   //!< Current mean reward estimate r̂_a (EWMA of -risk_cost).
+    uint64_t count;      //!< Number of times arm a has been selected (N_a).
+    bool initialized;    //!< False until the first control-plane reward update.
+
+    MabArm()
+        : rewardMean(0.0),
+          count(0),
+          initialized(false)
+    {
+    }
+  };
+
+  /// Per-next-hop MAB arm statistics.
+  std::map<Ipv4Address, MabArm> m_mabArms;
+  /// Total number of data-plane routing decisions made so far (t).
+  uint64_t m_mabTotalDecisions;
+  /// UCB exploration constant c (0 disables exploration → pure exploitation).
+  double m_mabC;
+
   // ---- Random variable ----
   Ptr<UniformRandomVariable> m_uniformRandomVariable;
 
@@ -220,7 +246,7 @@ private:
 
   bool Lookup(const Ipv4Address& dest, RoutingTableEntry& outEntry) const;
   bool FindSendEntry(const RoutingTableEntry& entry, RoutingTableEntry& outEntry) const;
-  bool ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out) const;
+  bool ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out);
 
   // ---- ETX helpers ----
   void UpdateNeighborEtx(const Ipv4Address& neighborIfaceAddr, Time helloInterval);
