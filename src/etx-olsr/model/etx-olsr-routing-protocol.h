@@ -31,7 +31,9 @@
 #include "ns3/output-stream-wrapper.h"
 
 #include <array>
+#include <deque>
 #include <map>
+#include <set>
 #include <vector>
 #include <limits>
 #include <cmath>
@@ -185,21 +187,27 @@ private:
   using CandidateSet = std::array<CandidateRoute, 2>;
   std::map<Ipv4Address, CandidateSet> m_candidateTable;
 
-  // ---- MAB (UCB1) state for data-plane arm selection ----
+  // ---- MAB (SW-UCB) state for data-plane arm selection ----
   /**
-   * Per-arm statistics maintained for the UCB1 algorithm.
-   * Each candidate next-hop constitutes one "arm" of the bandit.
+   * Per-arm statistics for the Sliding-Window UCB (SW-UCB) bandit.
+   *
+   * The reward for each arm is the **instantaneous** link ETX observed at
+   * forwarding time (a real data-plane measurement), NOT the control-plane
+   * Dijkstra cost.  Only the W most recent rewards are kept, so the bandit
+   * can track non-stationary interference without being anchored to stale
+   * history (solves the non-stationarity problem of vanilla UCB1).
+   *
+   * SW-UCB score: mean(window) + c · sqrt( ln(t) / |window| )
+   *   where t = cumulative total decisions (drives exploration bonus decay)
+   *   and |window| = current window occupancy (≤ W).
    */
   struct MabArm
   {
-    double rewardMean;   //!< Current mean reward estimate r̂_a (EWMA of -risk_cost).
-    uint64_t count;      //!< Number of times arm a has been selected (N_a).
-    bool initialized;    //!< False until the first control-plane reward update.
+    std::deque<double> window; //!< Sliding window of recent instantaneous rewards.
+    uint64_t totalCount;       //!< Cumulative selection count across all time (drives ln(t)).
 
     MabArm()
-        : rewardMean(0.0),
-          count(0),
-          initialized(false)
+        : totalCount(0)
     {
     }
   };
@@ -208,8 +216,12 @@ private:
   std::map<Ipv4Address, MabArm> m_mabArms;
   /// Total number of data-plane routing decisions made so far (t).
   uint64_t m_mabTotalDecisions;
-  /// UCB exploration constant c (0 disables exploration → pure exploitation).
+  /// SW-UCB exploration constant c (0 disables exploration → pure exploitation).
   double m_mabC;
+  /// Sliding-window size W for SW-UCB; only the W most recent rewards are retained.
+  uint32_t m_mabWindow;
+  /// Extra ETX penalty added when the backup path's penultimate node lies on the primary path.
+  double m_diversityPenalty;
 
   // ---- Random variable ----
   Ptr<UniformRandomVariable> m_uniformRandomVariable;
@@ -247,6 +259,12 @@ private:
   bool Lookup(const Ipv4Address& dest, RoutingTableEntry& outEntry) const;
   bool FindSendEntry(const RoutingTableEntry& entry, RoutingTableEntry& outEntry) const;
   bool ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out);
+
+  /**
+   * Build the set of intermediate node addresses on the primary (Dijkstra) path
+   * from this node to @p dest.  Used to detect shared nodes with backup paths.
+   */
+  std::set<Ipv4Address> BuildPrimaryPathNodes(const Ipv4Address& dest) const;
 
   // ---- ETX helpers ----
   void UpdateNeighborEtx(const Ipv4Address& neighborIfaceAddr, Time helloInterval);

@@ -151,11 +151,27 @@ RoutingProtocol::GetTypeId()
                         MakeDoubleAccessor(&RoutingProtocol::m_lambda),
                         MakeDoubleChecker<double>(0.0))
           .AddAttribute("MabC",
-                        "UCB1 exploration constant c for MAB-based data-plane candidate "
-                        "selection. score = r̂_a + c·sqrt(ln(t)/N_a). "
+                        "SW-UCB exploration constant c for MAB-based data-plane candidate "
+                        "selection. score = mean(window) + c·sqrt(ln(t)/|window|). "
                         "Set to 0 to disable exploration (pure exploitation).",
                         DoubleValue(1.0),
                         MakeDoubleAccessor(&RoutingProtocol::m_mabC),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("MabWindow",
+                        "Sliding-window size W for SW-UCB reward tracking. "
+                        "Only the W most recent data-plane rewards influence "
+                        "the arm mean and exploration bonus, allowing the "
+                        "bandit to adapt to non-stationary jamming.",
+                        UintegerValue(20),
+                        MakeUintegerAccessor(&RoutingProtocol::m_mabWindow),
+                        MakeUintegerChecker<uint32_t>(1))
+          .AddAttribute("DiversityPenalty",
+                        "Extra ETX cost added to backup-path candidates whose "
+                        "penultimate node also lies on the primary path "
+                        "(node-disjoint diversity approximation). Higher values "
+                        "push the backup toward a more topologically diverse route.",
+                        DoubleValue(2.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_diversityPenalty),
                         MakeDoubleChecker<double>(0.0))
           .AddTraceSource("Rx",
                           "Receive ETX-OLSR packet.",
@@ -185,7 +201,9 @@ RoutingProtocol::RoutingProtocol()
       m_beta(0.3),
       m_lambda(1.0),
       m_mabTotalDecisions(0),
-      m_mabC(1.0)
+      m_mabC(1.0),
+      m_mabWindow(20),
+      m_diversityPenalty(2.0)
 {
   m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
   m_hnaRoutingTable = Create<Ipv4StaticRouting>();
@@ -1009,9 +1027,14 @@ RoutingProtocol::RoutingTableComputation()
     cset[0].interface = primaryEntry.interface;
     cset[0].ctrlCost = primaryEntry.etxDistance;
 
+    // Node-disjoint diversity: build the set of intermediate nodes on the
+    // primary path so we can penalise backup routes that share those nodes.
+    const std::set<Ipv4Address> primaryNodes = BuildPrimaryPathNodes(dest);
+
     Ipv4Address backupNext;
     uint32_t backupIf = 0;
     double backupCost = std::numeric_limits<double>::infinity();
+    double backupRiskScore = std::numeric_limits<double>::infinity();
 
     for (const auto& topo : topology)
     {
@@ -1033,8 +1056,30 @@ RoutingProtocol::RoutingTableComputation()
       }
 
       double candCost = lastEntry.etxDistance + m_initialEtx;
-      if (candCost < backupCost)
+
+      // Risk-aware backup scoring: penalise variance of the backup first-hop.
+      double candSigma = 0.0;
       {
+        auto sigIt = m_sigma.find(candNext);
+        if (sigIt != m_sigma.end())
+        {
+          candSigma = std::sqrt(sigIt->second);
+        }
+      }
+      double riskScore = candCost + m_lambda * candSigma;
+
+      // Diversity penalty: if the backup's penultimate node is also on the
+      // primary path, the two routes share intermediate infrastructure and
+      // offer no real redundancy.  Add an extra cost to push selection toward
+      // a more topologically disjoint alternative.
+      if (!primaryNodes.empty() && primaryNodes.count(topo.lastAddr) > 0)
+      {
+        riskScore += m_diversityPenalty;
+      }
+
+      if (riskScore < backupRiskScore)
+      {
+        backupRiskScore = riskScore;
         backupCost = candCost;
         backupNext = candNext;
         backupIf = lastEntry.interface;
@@ -1100,51 +1145,6 @@ RoutingProtocol::RoutingTableComputation()
     }
   }
   // ---------------- end candidate table ----------------
-
-  // ---- MAB arm reward update (Control-Plane timescale) ----
-  // For every candidate next-hop in the table, compute the current risk-adjusted
-  // reward and update the MAB arm's mean reward estimate via EWMA:
-  //   reward = -(ctrlCost + lambda*sigma)  [negative cost = reward we want to maximize]
-  //   r̂_a   <- alpha*r̂_a + (1-alpha)*reward  [on subsequent observations]
-  // On cold-start (arm not yet observed) the current reward is used directly.
-  for (const auto& kv : m_candidateTable)
-  {
-    const CandidateSet& cset = kv.second;
-    for (std::size_t k = 0; k < cset.size(); k++)
-    {
-      const CandidateRoute& cand = cset[k];
-      if (cand.nextHop == Ipv4Address() || std::isinf(cand.ctrlCost))
-      {
-        continue;
-      }
-
-      double sigma = 0.0;
-      auto sigIt = m_sigma.find(cand.nextHop);
-      if (sigIt != m_sigma.end())
-      {
-        sigma = std::sqrt(sigIt->second);
-      }
-
-      double reward = -(cand.ctrlCost + m_lambda * sigma);
-
-      MabArm& arm = m_mabArms[cand.nextHop];
-      if (!arm.initialized)
-      {
-        arm.rewardMean = reward;
-        arm.initialized = true;
-      }
-      else
-      {
-        arm.rewardMean = m_etxAlpha * arm.rewardMean + (1.0 - m_etxAlpha) * reward;
-      }
-
-      NS_LOG_DEBUG("MAB reward update: nextHop=" << cand.nextHop
-                   << " reward=" << reward
-                   << " rewardMean=" << arm.rewardMean
-                   << " count=" << arm.count);
-    }
-  }
-  // ---- end MAB arm reward update ----
 
   NS_LOG_DEBUG("Node " << m_mainAddress << ": ETX RoutingTableComputation end. "
                        << GetSize() << " routes.");
@@ -2224,24 +2224,29 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
     return false;
   };
 
-  // MAB (UCB1) selection — Data-Plane timescale.
+  // MAB (SW-UCB) selection — Data-Plane timescale.
   //
-  // Each candidate next-hop is treated as a bandit arm a.
-  // UCB score: score_a = r̂_a + c · sqrt( ln(t) / N_a )
-  //   r̂_a  = mean reward estimate (updated by control-plane EWMA; reward = -risk_cost)
-  //   N_a   = number of times arm a has been selected so far
-  //   t     = total data-plane decisions made so far (+1 to keep ln(t) ≥ 0)
-  //   c     = m_mabC (exploration constant)
+  // Two-timescale architecture:
+  //   Control plane (slow): computes μ + λσ for candidate ranking (backup selection).
+  //   Data plane   (fast) : SW-UCB selects the arm to forward through; reward comes
+  //                         from the *instantaneous* link ETX of the chosen next-hop,
+  //                         which reflects real-time PRR observed on HELLO packets —
+  //                         a true data-plane measurement independent of Dijkstra.
   //
-  // Arms with N_a == 0 receive score = +∞ (always explored before exploitation).
-  // Among arms with the same score, the lower index (primary path) wins.
+  // SW-UCB score: score_a = mean(window_a) + c · sqrt( ln(t) / |window_a| )
+  //   window_a  = sliding window of the W most recent instantaneous rewards
+  //   |window_a| = current occupancy of the window (≤ W = m_mabWindow)
+  //   t          = m_mabTotalDecisions + 1  (cumulative; keeps ln(t) ≥ 0)
+  //   c          = m_mabC (exploration constant)
+  //
+  // Arms with an empty window receive score = +∞ (always explored first).
 
   const double negInf = -std::numeric_limits<double>::infinity();
   double bestScore = negInf;
   int bestK = -1;
 
-  uint64_t t = m_mabTotalDecisions + 1; // +1 keeps ln(t) >= 0 for the first non-cold-start arm
-  double logT = std::log(static_cast<double>(t)); // hoisted: constant across all arms
+  uint64_t t = m_mabTotalDecisions + 1;
+  double logT = std::log(static_cast<double>(t));
 
   for (int k = 0; k < static_cast<int>(cset.size()); k++)
   {
@@ -2253,37 +2258,31 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
 
     auto armIt = m_mabArms.find(cand.nextHop);
 
-    // Reward estimate: use control-plane EWMA if available, otherwise bootstrap
-    // from the current risk-adjusted cost  -(ctrlCost + m_lambda*sigma)  so the
-    // formula is consistent with the periodic update in RoutingTableComputation().
-    double rHat;
-    if (armIt != m_mabArms.end() && armIt->second.initialized)
-    {
-      rHat = armIt->second.rewardMean;
-    }
-    else
-    {
-      double sigmaFallback = 0.0;
-      auto sigIt = m_sigma.find(cand.nextHop);
-      if (sigIt != m_sigma.end())
-      {
-        sigmaFallback = std::sqrt(sigIt->second);
-      }
-      rHat = -(cand.ctrlCost + m_lambda * sigmaFallback);
-    }
-
-    uint64_t count = (armIt != m_mabArms.end()) ? armIt->second.count : 0;
-
     double ucbScore;
-    if (count == 0)
+    if (armIt == m_mabArms.end() || armIt->second.window.empty())
     {
-      // Cold-start: give unvisited arms the highest possible priority.
+      // Cold-start: unvisited arm — always explore first.
       ucbScore = std::numeric_limits<double>::infinity();
     }
     else
     {
-      double exploration = m_mabC * std::sqrt(logT / static_cast<double>(count));
-      ucbScore = rHat + exploration;
+      const MabArm& arm = armIt->second;
+      std::size_t w = arm.window.size();
+
+      // Compute window mean over the W most recent data-plane rewards.
+      double windowMean = 0.0;
+      for (const double r : arm.window)
+      {
+        windowMean += r;
+      }
+      windowMean /= static_cast<double>(w);
+
+      // Exploration bonus: use window occupancy as denominator so the bonus
+      // rises quickly after a topology change clears old window entries.
+      double exploration = (m_mabC > 0.0)
+                               ? m_mabC * std::sqrt(logT / static_cast<double>(w))
+                               : 0.0;
+      ucbScore = windowMean + exploration;
     }
 
     if (ucbScore > bestScore)
@@ -2296,37 +2295,105 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
   if (bestK >= 0)
   {
     out = cset[bestK];
-
-    // Update MAB arm statistics for the selected arm.
     m_mabTotalDecisions++;
-    MabArm& arm = m_mabArms[out.nextHop];
-    arm.count++;
-    if (!arm.initialized)
-    {
-      // Edge-case: arm reached here without a control-plane update yet.
-      // Use risk-adjusted cost (same formula as RoutingTableComputation) for consistency.
-      double sigmaEdge = 0.0;
-      auto sigIt = m_sigma.find(out.nextHop);
-      if (sigIt != m_sigma.end())
-      {
-        sigmaEdge = std::sqrt(sigIt->second);
-      }
-      arm.rewardMean = -(out.ctrlCost + m_lambda * sigmaEdge);
-      arm.initialized = true;
-    }
 
-    NS_LOG_DEBUG("ChooseCandidate (UCB1): dest=" << dest
+    // ---- Data-plane reward (real observation) ----
+    // Use the *instantaneous* ETX of the chosen next-hop's direct link.
+    // This is derived from the live PRR maintained via HELLO reception:
+    // a genuine physical-layer measurement that changes with interference
+    // and mobility, independent of the control-plane Dijkstra path cost.
+    //
+    // GetLinkEtx is always well-defined: it returns m_initialEtx for
+    // links not yet seen, and 1/prr (clamped to [1, 100]) for known links.
+    // instantReward is therefore always in the range [-100, -1].
+    double instantReward = -GetLinkEtx(out.nextHop);
+
+    MabArm& arm = m_mabArms[out.nextHop];
+    // Evict the oldest sample before inserting the new one so the window
+    // never holds more than m_mabWindow entries (invariant: size ≤ W).
+    // m_mabWindow is uint32_t; the explicit cast to std::size_t avoids an
+    // implicit mixed-type comparison with deque::size_type.
+    if (arm.window.size() >= static_cast<std::size_t>(m_mabWindow))
+    {
+      arm.window.pop_front();
+    }
+    arm.window.push_back(instantReward);
+    arm.totalCount++;
+
+    NS_LOG_DEBUG("ChooseCandidate (SW-UCB): dest=" << dest
                  << " k=" << bestK
                  << " nextHop=" << out.nextHop
                  << " ucbScore=" << bestScore
-                 << " rHat=" << arm.rewardMean
-                 << " count=" << arm.count
+                 << " instantReward=" << instantReward
+                 << " windowSize=" << arm.window.size()
+                 << " totalCount=" << arm.totalCount
                  << " t=" << m_mabTotalDecisions);
     return true;
   }
 
   NS_LOG_DEBUG("ChooseCandidate: dest=" << dest << " no candidate available");
   return false;
+}
+
+std::set<Ipv4Address>
+RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
+{
+  // Walk the primary (Dijkstra) path from this node to dest by chasing
+  // topology entries that share the same first-hop as the primary route.
+  // Returns the set of intermediate addresses (including dest) so the
+  // backup-selection code can penalise routes that share those nodes.
+  std::set<Ipv4Address> nodes;
+
+  RoutingTableEntry destEntry;
+  if (!Lookup(dest, destEntry))
+  {
+    return nodes;
+  }
+
+  Ipv4Address primaryNext = destEntry.nextAddr;
+  nodes.insert(dest);
+
+  // Trace from dest backwards toward the first-hop by following topology
+  // entries that all share the same primary next-hop.
+  // MAX_PATH_TRACE_HOPS = 32: OLSR networks in UAV swarms rarely exceed
+  // ~10 hops, and RFC 3626 recommends a default network diameter of 8.
+  // 32 provides ample headroom while bounding worst-case walk time.
+  static constexpr int MAX_PATH_TRACE_HOPS = 32;
+  Ipv4Address cur = dest;
+  for (int limit = 0; limit < MAX_PATH_TRACE_HOPS; limit++)
+  {
+    if (cur == primaryNext)
+    {
+      break; // reached the first-hop — nothing further to trace
+    }
+
+    const olsr::TopologySet& topology = m_state.GetTopologySet();
+    bool advanced = false;
+    for (const auto& topo : topology)
+    {
+      if (topo.destAddr != cur)
+      {
+        continue;
+      }
+      RoutingTableEntry le;
+      if (!Lookup(topo.lastAddr, le))
+      {
+        continue;
+      }
+      if (le.nextAddr == primaryNext)
+      {
+        nodes.insert(topo.lastAddr);
+        cur = topo.lastAddr;
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced)
+    {
+      break;
+    }
+  }
+  return nodes;
 }
 
 void
