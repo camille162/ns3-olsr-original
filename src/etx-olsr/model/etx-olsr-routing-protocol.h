@@ -29,6 +29,7 @@
 #include "ns3/timer.h"
 #include "ns3/traced-callback.h"
 #include "ns3/output-stream-wrapper.h"
+#include "ns3/tag.h"
 
 #include <array>
 #include <deque>
@@ -42,6 +43,25 @@ namespace ns3
 {
 namespace etxolsr
 {
+
+/**
+ * @ingroup etx-olsr
+ * Packet tag carrying a send-time timestamp for single-hop delay measurement.
+ */
+class TimestampTag : public Tag
+{
+public:
+  static TypeId GetTypeId();
+  TypeId GetInstanceTypeId() const override;
+  uint32_t GetSerializedSize() const override;
+  void Serialize(TagBuffer i) const override;
+  void Deserialize(TagBuffer i) override;
+  void Print(std::ostream& os) const override;
+  void SetTimestamp(Time t);
+  Time GetTimestamp() const;
+private:
+  Time m_timestamp;
+};
 
 /**
  * @ingroup etx-olsr
@@ -184,7 +204,7 @@ private:
     }
   };
 
-  using CandidateSet = std::array<CandidateRoute, 2>;
+  using CandidateSet = std::array<CandidateRoute, 3>;
   std::map<Ipv4Address, CandidateSet> m_candidateTable;
 
   // ---- MAB (SW-UCB) state for data-plane arm selection ----
@@ -203,8 +223,9 @@ private:
    */
   struct MabArm
   {
-    std::deque<double> window; //!< Sliding window of recent instantaneous rewards.
-    uint64_t totalCount;       //!< Cumulative selection count across all time (drives ln(t)).
+    std::deque<double> window;        //!< Sliding window of recent instantaneous rewards.
+    std::deque<double> rewardHistory; //!< Last 5 normalized rewards for trend detection.
+    uint64_t totalCount;              //!< Cumulative selection count across all time.
 
     MabArm()
         : totalCount(0)
@@ -222,6 +243,30 @@ private:
   uint32_t m_mabWindow;
   /// Extra ETX penalty added when the backup path's penultimate node lies on the primary path.
   double m_diversityPenalty;
+
+  // ---- Data-plane delay state ----
+  /// Per-next-hop EWMA smoothed one-hop delay (seconds).
+  std::map<Ipv4Address, double> m_smoothDelay;
+  /// EWMA factor for delay smoothing (α_d = 0.8).
+  double m_mabAlphaD;
+  /// Normalization ceiling for delay (D_max = 0.1 s = 100 ms).
+  double m_dMax;
+  /// Weight of ETX term in the reward formula (α = 0.6).
+  double m_rewardAlpha;
+  /// Weight of delay term in the reward formula (β = 0.4).
+  double m_rewardBeta;
+  /// Trend penalty weight in UCB formula (γ = 0.3).
+  double m_mabGamma;
+  /// Soft overlap-ratio penalty weight P for K=3 path building.
+  double m_softPenalty;
+
+  // ---- Path-switch rate tracking ----
+  /// Per-destination: last chosen next-hop (for switch detection).
+  std::map<Ipv4Address, Ipv4Address> m_lastNextHop;
+  /// Total path switches since m_switchWindowStart.
+  uint32_t m_switchCount;
+  /// Start of the current switch-rate measurement window.
+  Time m_switchWindowStart;
 
   // ---- Random variable ----
   Ptr<UniformRandomVariable> m_uniformRandomVariable;
@@ -260,11 +305,19 @@ private:
   bool FindSendEntry(const RoutingTableEntry& entry, RoutingTableEntry& outEntry) const;
   bool ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out);
 
+  /// Update MAB arm for @p nextHop with normalised reward derived from ETX and delay.
+  void UpdateMabModel(const Ipv4Address& nextHop, double instantEtx, double smoothDelay);
+
+  /// Compute trend from the last (up to 5) reward-history samples.
+  double ComputeTrend(const std::deque<double>& hist) const;
+
   /**
-   * Build the set of intermediate node addresses on the primary (Dijkstra) path
-   * from this node to @p dest.  Used to detect shared nodes with backup paths.
+   * Build the set of intermediate node addresses on the path from this node
+   * to @p dest when using @p firstHop as the first-hop next-hop.
+   * Generalisation of BuildPrimaryPathNodes for arbitrary first-hops.
    */
-  std::set<Ipv4Address> BuildPrimaryPathNodes(const Ipv4Address& dest) const;
+  std::set<Ipv4Address> BuildPathNodes(const Ipv4Address& dest,
+                                       const Ipv4Address& firstHop) const;
 
   // ---- ETX helpers ----
   void UpdateNeighborEtx(const Ipv4Address& neighborIfaceAddr, Time helloInterval);

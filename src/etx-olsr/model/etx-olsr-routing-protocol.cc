@@ -66,6 +66,62 @@ NS_LOG_COMPONENT_DEFINE("EtxOlsrRoutingProtocol");
 namespace etxolsr
 {
 
+// ---- TimestampTag implementation ----
+NS_OBJECT_ENSURE_REGISTERED(TimestampTag);
+
+TypeId
+TimestampTag::GetTypeId()
+{
+  static TypeId tid = TypeId("ns3::etxolsr::TimestampTag")
+                          .SetParent<Tag>()
+                          .SetGroupName("EtxOlsr")
+                          .AddConstructor<TimestampTag>();
+  return tid;
+}
+
+TypeId
+TimestampTag::GetInstanceTypeId() const
+{
+  return GetTypeId();
+}
+
+uint32_t
+TimestampTag::GetSerializedSize() const
+{
+  return 8; // int64_t nanoseconds
+}
+
+void
+TimestampTag::Serialize(TagBuffer i) const
+{
+  i.WriteU64(m_timestamp.GetNanoSeconds());
+}
+
+void
+TimestampTag::Deserialize(TagBuffer i)
+{
+  m_timestamp = NanoSeconds(i.ReadU64());
+}
+
+void
+TimestampTag::Print(std::ostream& os) const
+{
+  os << "ts=" << m_timestamp.GetSeconds() << "s";
+}
+
+void
+TimestampTag::SetTimestamp(Time t)
+{
+  m_timestamp = t;
+}
+
+Time
+TimestampTag::GetTimestamp() const
+{
+  return m_timestamp;
+}
+// ---- end TimestampTag ----
+
 enum class LinkType : uint8_t
 {
   UNSPEC_LINK = 0,
@@ -173,6 +229,38 @@ RoutingProtocol::GetTypeId()
                         DoubleValue(2.0),
                         MakeDoubleAccessor(&RoutingProtocol::m_diversityPenalty),
                         MakeDoubleChecker<double>(0.0))
+          .AddAttribute("SoftPenalty",
+                        "Overlap-ratio penalty P used when building the 2nd and 3rd "
+                        "candidate path (K=3). cost += P * overlap_ratio.",
+                        DoubleValue(75.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_softPenalty),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("MabGamma",
+                        "Trend penalty weight γ in the UCB formula: "
+                        "score = μ + c·√(ln(t)/N) − γ·Trend.",
+                        DoubleValue(0.3),
+                        MakeDoubleAccessor(&RoutingProtocol::m_mabGamma),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("RewardAlpha",
+                        "ETX weight α in normalised reward: -(α·ETX_norm + β·D_norm).",
+                        DoubleValue(0.6),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardAlpha),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("RewardBeta",
+                        "Delay weight β in normalised reward: -(α·ETX_norm + β·D_norm).",
+                        DoubleValue(0.4),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardBeta),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("DelayEwmaAlpha",
+                        "EWMA smoothing factor α_d for per-hop delay (0=freeze, 1=no memory).",
+                        DoubleValue(0.8),
+                        MakeDoubleAccessor(&RoutingProtocol::m_mabAlphaD),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("DelayMax",
+                        "D_max (seconds) used to normalise delay: D_norm = min(1, delay/D_max).",
+                        DoubleValue(0.1),
+                        MakeDoubleAccessor(&RoutingProtocol::m_dMax),
+                        MakeDoubleChecker<double>(1e-9))
           .AddTraceSource("Rx",
                           "Receive ETX-OLSR packet.",
                           MakeTraceSourceAccessor(&RoutingProtocol::m_rxPacketTrace),
@@ -203,7 +291,15 @@ RoutingProtocol::RoutingProtocol()
       m_mabTotalDecisions(0),
       m_mabC(1.0),
       m_mabWindow(20),
-      m_diversityPenalty(2.0)
+      m_diversityPenalty(2.0),
+      m_mabAlphaD(0.8),
+      m_dMax(0.1),
+      m_rewardAlpha(0.6),
+      m_rewardBeta(0.4),
+      m_mabGamma(0.3),
+      m_softPenalty(75.0),
+      m_switchCount(0),
+      m_switchWindowStart(Seconds(0.0))
 {
   m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
   m_hnaRoutingTable = Create<Ipv4StaticRouting>();
@@ -265,6 +361,8 @@ RoutingProtocol::DoDispose()
   m_sigma.clear();
   m_prevCandCost.clear();
   m_mabArms.clear();
+  m_smoothDelay.clear();
+  m_lastNextHop.clear();
 
   Ipv4RoutingProtocol::DoDispose();
 }
@@ -1013,7 +1111,7 @@ RoutingProtocol::RoutingTableComputation()
     }
   }
 
-  // ---------------- Phase-1 candidate table (K=2) ----------------
+  // ---------------- Phase-1 candidate table (K=3) ----------------
   m_candidateTable.clear();
   const olsr::TopologySet& topology = m_state.GetTopologySet();
 
@@ -1023,18 +1121,19 @@ RoutingProtocol::RoutingTableComputation()
     const RoutingTableEntry& primaryEntry = kv.second;
 
     CandidateSet cset;
-    cset[0].nextHop = primaryEntry.nextAddr;
+    cset[0].nextHop   = primaryEntry.nextAddr;
     cset[0].interface = primaryEntry.interface;
-    cset[0].ctrlCost = primaryEntry.etxDistance;
+    cset[0].ctrlCost  = primaryEntry.etxDistance;
 
-    // Node-disjoint diversity: build the set of intermediate nodes on the
-    // primary path so we can penalise backup routes that share those nodes.
-    const std::set<Ipv4Address> primaryNodes = BuildPrimaryPathNodes(dest);
+    // Path-1 node set (for overlap penalisation of paths 2 and 3).
+    const std::set<Ipv4Address> path1Nodes = BuildPathNodes(dest, cset[0].nextHop);
+    const double refSize1 = static_cast<double>(path1Nodes.size());
 
-    Ipv4Address backupNext;
-    uint32_t backupIf = 0;
-    double backupCost = std::numeric_limits<double>::infinity();
-    double backupRiskScore = std::numeric_limits<double>::infinity();
+    // ---- Find path 2 ----
+    Ipv4Address best2Next;
+    uint32_t    best2If   = 0;
+    double      best2Cost = std::numeric_limits<double>::infinity();
+    double      best2Risk = std::numeric_limits<double>::infinity();
 
     for (const auto& topo : topology)
     {
@@ -1042,7 +1141,6 @@ RoutingProtocol::RoutingTableComputation()
       {
         continue;
       }
-
       RoutingTableEntry lastEntry;
       if (!Lookup(topo.lastAddr, lastEntry))
       {
@@ -1050,14 +1148,10 @@ RoutingProtocol::RoutingTableComputation()
       }
 
       Ipv4Address candNext = lastEntry.nextAddr;
-      if (candNext == cset[0].nextHop)
-      {
-        continue;
-      }
 
       double candCost = lastEntry.etxDistance + m_initialEtx;
 
-      // Risk-aware backup scoring: penalise variance of the backup first-hop.
+      // Risk term: variance of this next-hop.
       double candSigma = 0.0;
       {
         auto sigIt = m_sigma.find(candNext);
@@ -1066,50 +1160,132 @@ RoutingProtocol::RoutingTableComputation()
           candSigma = std::sqrt(sigIt->second);
         }
       }
-      double riskScore = candCost + m_lambda * candSigma;
 
-      // Diversity penalty: if the backup's penultimate node is also on the
-      // primary path, the two routes share intermediate infrastructure and
-      // offer no real redundancy.  Add an extra cost to push selection toward
-      // a more topologically disjoint alternative.
-      if (!primaryNodes.empty() && primaryNodes.count(topo.lastAddr) > 0)
+      // Soft overlap penalty for path 2 (vs. path 1 node set).
+      double overlapRatio = 0.0;
+      if (refSize1 > 0.0)
       {
-        riskScore += m_diversityPenalty;
+        const std::set<Ipv4Address> candNodes = BuildPathNodes(dest, candNext);
+        double overlap = 0.0;
+        for (const auto& n : candNodes)
+        {
+          if (path1Nodes.count(n))
+          {
+            overlap += 1.0;
+          }
+        }
+        overlapRatio = overlap / refSize1;
       }
 
-      if (riskScore < backupRiskScore)
+      double riskScore = candCost + m_lambda * candSigma + m_softPenalty * overlapRatio;
+
+      if (riskScore < best2Risk)
       {
-        backupRiskScore = riskScore;
-        backupCost = candCost;
-        backupNext = candNext;
-        backupIf = lastEntry.interface;
+        best2Risk = riskScore;
+        best2Cost = candCost;
+        best2Next = candNext;
+        best2If   = lastEntry.interface;
       }
     }
 
-    if (backupNext != Ipv4Address())
+    if (best2Next != Ipv4Address())
     {
-      cset[1].nextHop = backupNext;
-      cset[1].interface = backupIf;
-      cset[1].ctrlCost = backupCost;
+      cset[1].nextHop   = best2Next;
+      cset[1].interface = best2If;
+      cset[1].ctrlCost  = best2Cost;
     }
     else
     {
-      cset[1] = cset[0];
+      cset[1] = cset[0]; // graceful degradation: fall back to primary
+    }
+
+    // ---- Find path 3 ----
+    // Build the union of path-1 and path-2 node sets for reference.
+    std::set<Ipv4Address> path12Nodes = path1Nodes;
+    if (best2Next != Ipv4Address())
+    {
+      const std::set<Ipv4Address> p2nodes = BuildPathNodes(dest, best2Next);
+      path12Nodes.insert(p2nodes.begin(), p2nodes.end());
+    }
+    const double refSize12 = static_cast<double>(path12Nodes.size());
+
+    Ipv4Address best3Next;
+    uint32_t    best3If   = 0;
+    double      best3Cost = std::numeric_limits<double>::infinity();
+    double      best3Risk = std::numeric_limits<double>::infinity();
+
+    for (const auto& topo : topology)
+    {
+      if (topo.destAddr != dest)
+      {
+        continue;
+      }
+      RoutingTableEntry lastEntry;
+      if (!Lookup(topo.lastAddr, lastEntry))
+      {
+        continue;
+      }
+
+      Ipv4Address candNext = lastEntry.nextAddr;
+
+      double candCost = lastEntry.etxDistance + m_initialEtx;
+
+      double candSigma = 0.0;
+      {
+        auto sigIt = m_sigma.find(candNext);
+        if (sigIt != m_sigma.end())
+        {
+          candSigma = std::sqrt(sigIt->second);
+        }
+      }
+
+      // Soft overlap penalty for path 3 (vs. path 1+2 node union).
+      double overlapRatio = 0.0;
+      if (refSize12 > 0.0)
+      {
+        const std::set<Ipv4Address> candNodes = BuildPathNodes(dest, candNext);
+        double overlap = 0.0;
+        for (const auto& n : candNodes)
+        {
+          if (path12Nodes.count(n))
+          {
+            overlap += 1.0;
+          }
+        }
+        overlapRatio = overlap / refSize12;
+      }
+
+      double riskScore = candCost + m_lambda * candSigma + m_softPenalty * overlapRatio;
+
+      if (riskScore < best3Risk)
+      {
+        best3Risk = riskScore;
+        best3Cost = candCost;
+        best3Next = candNext;
+        best3If   = lastEntry.interface;
+      }
+    }
+
+    if (best3Next != Ipv4Address())
+    {
+      cset[2].nextHop   = best3Next;
+      cset[2].interface = best3If;
+      cset[2].ctrlCost  = best3Cost;
+    }
+    else
+    {
+      cset[2] = cset[1]; // graceful degradation: fall back to second path
     }
 
     m_candidateTable[dest] = cset;
 
-    NS_LOG_DEBUG("CandidateTable: dest=" << dest
-                  << " primary=" << cset[0].nextHop
-                  << " backup=" << cset[1].nextHop);
+    NS_LOG_DEBUG("CandidateTable(K=3): dest=" << dest
+                  << " p1=" << cset[0].nextHop
+                  << " p2=" << cset[1].nextHop
+                  << " p3=" << cset[2].nextHop);
   }
 
   // ---- Risk-aware: update per-next-hop variance σ² (Control-Plane timescale) ----
-  // For every candidate next-hop that appears in the table, compare the current
-  // path-cost estimate (V̂) against the previously stored value.  The squared
-  // prediction error drives an EWMA variance estimate:
-  //   e  = ctrlCost_now - ctrlCost_prev
-  //   σ² ← (1-β)·σ² + β·e²
   for (const auto& kv : m_candidateTable)
   {
     const CandidateSet& cset = kv.second;
@@ -1122,9 +1298,6 @@ RoutingProtocol::RoutingTableComputation()
       }
 
       auto prevIt = m_prevCandCost.find(cand.nextHop);
-      // On the first observation for a next-hop, prevCost == ctrlCost, so error = 0
-      // and σ² remains at its initial value of 0.  Variance warms up from the second
-      // routing-table computation onwards (cold-start by design).
       double prevCost = (prevIt != m_prevCandCost.end()) ? prevIt->second : cand.ctrlCost;
 
       double error = cand.ctrlCost - prevCost;
