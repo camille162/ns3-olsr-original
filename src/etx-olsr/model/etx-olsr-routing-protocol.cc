@@ -1104,8 +1104,8 @@ RoutingProtocol::RoutingTableComputation()
   // ---- MAB arm reward update (Control-Plane timescale) ----
   // For every candidate next-hop in the table, compute the current risk-adjusted
   // reward and update the MAB arm's mean reward estimate via EWMA:
-  //   reward = -(ctrlCost + λ·σ)      [negative cost = reward we want to maximise]
-  //   r̂_a   ← α·r̂_a + (1-α)·reward  [on subsequent observations]
+  //   reward = -(ctrlCost + lambda*sigma)  [negative cost = reward we want to maximize]
+  //   r̂_a   <- alpha*r̂_a + (1-alpha)*reward  [on subsequent observations]
   // On cold-start (arm not yet observed) the current reward is used directly.
   for (const auto& kv : m_candidateTable)
   {
@@ -2240,7 +2240,8 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
   double bestScore = negInf;
   int bestK = -1;
 
-  uint64_t t = m_mabTotalDecisions + 1; // +1 avoids ln(0)
+  uint64_t t = m_mabTotalDecisions + 1; // +1 keeps ln(t) >= 0 for the first non-cold-start arm
+  double logT = std::log(static_cast<double>(t)); // hoisted: constant across all arms
 
   for (int k = 0; k < static_cast<int>(cset.size()); k++)
   {
@@ -2252,10 +2253,24 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
 
     auto armIt = m_mabArms.find(cand.nextHop);
 
-    // Fallback reward estimate for arms the control plane has not yet observed.
-    double rHat = (armIt != m_mabArms.end() && armIt->second.initialized)
-                      ? armIt->second.rewardMean
-                      : -(cand.ctrlCost);
+    // Reward estimate: use control-plane EWMA if available, otherwise bootstrap
+    // from the current risk-adjusted cost  -(ctrlCost + m_lambda*sigma)  so the
+    // formula is consistent with the periodic update in RoutingTableComputation().
+    double rHat;
+    if (armIt != m_mabArms.end() && armIt->second.initialized)
+    {
+      rHat = armIt->second.rewardMean;
+    }
+    else
+    {
+      double sigmaFallback = 0.0;
+      auto sigIt = m_sigma.find(cand.nextHop);
+      if (sigIt != m_sigma.end())
+      {
+        sigmaFallback = std::sqrt(sigIt->second);
+      }
+      rHat = -(cand.ctrlCost + m_lambda * sigmaFallback);
+    }
 
     uint64_t count = (armIt != m_mabArms.end()) ? armIt->second.count : 0;
 
@@ -2267,9 +2282,7 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
     }
     else
     {
-      double exploration =
-          m_mabC * std::sqrt(std::log(static_cast<double>(t)) /
-                             static_cast<double>(count));
+      double exploration = m_mabC * std::sqrt(logT / static_cast<double>(count));
       ucbScore = rHat + exploration;
     }
 
@@ -2291,7 +2304,14 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
     if (!arm.initialized)
     {
       // Edge-case: arm reached here without a control-plane update yet.
-      arm.rewardMean = -(out.ctrlCost);
+      // Use risk-adjusted cost (same formula as RoutingTableComputation) for consistency.
+      double sigmaEdge = 0.0;
+      auto sigIt = m_sigma.find(out.nextHop);
+      if (sigIt != m_sigma.end())
+      {
+        sigmaEdge = std::sqrt(sigIt->second);
+      }
+      arm.rewardMean = -(out.ctrlCost + m_lambda * sigmaEdge);
       arm.initialized = true;
     }
 
