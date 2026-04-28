@@ -261,6 +261,13 @@ RoutingProtocol::GetTypeId()
                         DoubleValue(0.1),
                         MakeDoubleAccessor(&RoutingProtocol::m_dMax),
                         MakeDoubleChecker<double>(1e-9))
+          .AddAttribute("EtxCeil",
+                        "Ceiling value used to normalise instantaneous ETX to [0,1]: "
+                        "ETX_norm = min(1, (ETX-1)/(EtxCeil-1)). "
+                        "ETX values at or above this are treated as the maximum penalty.",
+                        DoubleValue(10.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_etxCeil),
+                        MakeDoubleChecker<double>(1.0 + 1e-9))
           .AddTraceSource("Rx",
                           "Receive ETX-OLSR packet.",
                           MakeTraceSourceAccessor(&RoutingProtocol::m_rxPacketTrace),
@@ -294,6 +301,7 @@ RoutingProtocol::RoutingProtocol()
       m_diversityPenalty(2.0),
       m_mabAlphaD(0.8),
       m_dMax(0.1),
+      m_etxCeil(10.0),
       m_rewardAlpha(0.6),
       m_rewardBeta(0.4),
       m_mabGamma(0.3),
@@ -2561,13 +2569,13 @@ RoutingProtocol::UpdateMabModel(const Ipv4Address& nextHop,
                                 double instantDelay)
 {
   // Update EWMA delay estimate for this next-hop.
+  // Convention: α_d=0 freezes the estimate, α_d=1 discards history (uses latest only).
   double& sd = m_smoothDelay[nextHop];
-  sd = m_mabAlphaD * sd + (1.0 - m_mabAlphaD) * instantDelay;
+  sd = (1.0 - m_mabAlphaD) * sd + m_mabAlphaD * instantDelay;
 
-  // Normalise ETX to [0, 1] using a ceiling of 10.0.
-  // ETX = 1.0 is a perfect link; values above 10.0 are treated as maximum.
-  static constexpr double ETX_CEIL = 10.0;
-  double etxNorm = std::min(1.0, std::max(0.0, (instantEtx - 1.0) / (ETX_CEIL - 1.0)));
+  // Normalise ETX to [0, 1] using m_etxCeil as the upper bound.
+  // ETX = 1.0 is a perfect link; values at or above m_etxCeil are clamped to 1.
+  double etxNorm = std::min(1.0, std::max(0.0, (instantEtx - 1.0) / (m_etxCeil - 1.0)));
 
   // Normalise delay to [0, 1] using m_dMax.
   double dNorm = std::min(1.0, std::max(0.0, sd / m_dMax));

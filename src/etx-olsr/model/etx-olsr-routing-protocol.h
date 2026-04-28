@@ -247,10 +247,12 @@ private:
   // ---- Data-plane delay state ----
   /// Per-next-hop EWMA smoothed one-hop delay (seconds).
   std::map<Ipv4Address, double> m_smoothDelay;
-  /// EWMA factor for delay smoothing (α_d = 0.8).
+  /// EWMA factor for delay smoothing (0=freeze old value, 1=no memory/use latest).
   double m_mabAlphaD;
   /// Normalization ceiling for delay (D_max = 0.1 s = 100 ms).
   double m_dMax;
+  /// Normalization ceiling for ETX (ETX values above this are treated as maximum).
+  double m_etxCeil;
   /// Weight of ETX term in the reward formula (α = 0.6).
   double m_rewardAlpha;
   /// Weight of delay term in the reward formula (β = 0.4).
