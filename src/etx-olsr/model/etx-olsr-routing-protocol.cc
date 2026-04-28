@@ -331,12 +331,6 @@ RoutingProtocol::SetIpv4(Ptr<Ipv4> ipv4)
   m_hnaRoutingTable->SetIpv4(ipv4);
 }
 
-Ptr<Ipv4>
-RoutingProtocol::GetIpv4() const
-{
-  return m_ipv4;
-}
-
 void
 RoutingProtocol::DoDispose()
 {
@@ -2406,11 +2400,13 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
   //                         which reflects real-time PRR observed on HELLO packets —
   //                         a true data-plane measurement independent of Dijkstra.
   //
-  // SW-UCB score: score_a = mean(window_a) + c · sqrt( ln(t) / |window_a| )
-  //   window_a  = sliding window of the W most recent instantaneous rewards
+  // SW-UCB score: score_a = mean(window_a) + c · sqrt( ln(t) / |window_a| ) − γ · Trend
+  //   window_a  = sliding window of the W most recent normalised rewards
   //   |window_a| = current occupancy of the window (≤ W = m_mabWindow)
   //   t          = m_mabTotalDecisions + 1  (cumulative; keeps ln(t) ≥ 0)
   //   c          = m_mabC (exploration constant)
+  //   Trend      = degradation trend from the last 5 rewards (positive = worsening)
+  //   γ          = m_mabGamma (trend penalty weight; 0 disables trend correction)
   //
   // Arms with an empty window receive score = +∞ (always explored first).
 
@@ -2455,7 +2451,8 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
       double exploration = (m_mabC > 0.0)
                                ? m_mabC * std::sqrt(logT / static_cast<double>(w))
                                : 0.0;
-      ucbScore = windowMean + exploration;
+      double trend = (m_mabGamma > 0.0) ? ComputeTrend(arm.rewardHistory) : 0.0;
+      ucbScore = windowMean + exploration - m_mabGamma * trend;
     }
 
     if (ucbScore > bestScore)
@@ -2470,37 +2467,22 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
     out = cset[bestK];
     m_mabTotalDecisions++;
 
-    // ---- Data-plane reward (real observation) ----
-    // Use the *instantaneous* ETX of the chosen next-hop's direct link.
-    // This is derived from the live PRR maintained via HELLO reception:
-    // a genuine physical-layer measurement that changes with interference
-    // and mobility, independent of the control-plane Dijkstra path cost.
-    //
-    // GetLinkEtx is always well-defined: it returns m_initialEtx for
-    // links not yet seen, and 1/prr (clamped to [1, 100]) for known links.
-    // instantReward is therefore always in the range [-100, -1].
-    double instantReward = -GetLinkEtx(out.nextHop);
+    // ---- Data-plane reward (normalised, real observation) ----
+    // Use the instantaneous ETX of the chosen next-hop's direct link together
+    // with its current EWMA-smoothed delay to form a normalised reward.
+    // The actual reward formula and window update are handled by UpdateMabModel.
+    UpdateMabModel(out.nextHop, GetLinkEtx(out.nextHop), 0.0);
 
-    MabArm& arm = m_mabArms[out.nextHop];
-    // Evict the oldest sample before inserting the new one so the window
-    // never holds more than m_mabWindow entries (invariant: size ≤ W).
-    // m_mabWindow is uint32_t; the explicit cast to std::size_t avoids an
-    // implicit mixed-type comparison with deque::size_type.
-    if (arm.window.size() >= static_cast<std::size_t>(m_mabWindow))
     {
-      arm.window.pop_front();
+      const MabArm& arm = m_mabArms.at(out.nextHop);
+      NS_LOG_DEBUG("ChooseCandidate (SW-UCB): dest=" << dest
+                   << " k=" << bestK
+                   << " nextHop=" << out.nextHop
+                   << " ucbScore=" << bestScore
+                   << " windowSize=" << arm.window.size()
+                   << " totalCount=" << arm.totalCount
+                   << " t=" << m_mabTotalDecisions);
     }
-    arm.window.push_back(instantReward);
-    arm.totalCount++;
-
-    NS_LOG_DEBUG("ChooseCandidate (SW-UCB): dest=" << dest
-                 << " k=" << bestK
-                 << " nextHop=" << out.nextHop
-                 << " ucbScore=" << bestScore
-                 << " instantReward=" << instantReward
-                 << " windowSize=" << arm.window.size()
-                 << " totalCount=" << arm.totalCount
-                 << " t=" << m_mabTotalDecisions);
     return true;
   }
 
@@ -2509,25 +2491,15 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
 }
 
 std::set<Ipv4Address>
-RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
+RoutingProtocol::BuildPathNodes(const Ipv4Address& dest, const Ipv4Address& firstHop) const
 {
-  // Walk the primary (Dijkstra) path from this node to dest by chasing
-  // topology entries that share the same first-hop as the primary route.
-  // Returns the set of intermediate addresses (including dest) so the
-  // backup-selection code can penalise routes that share those nodes.
+  // Trace the path from this node toward @p dest when using @p firstHop as
+  // the first-hop next-hop.  Returns all intermediate node addresses
+  // (including dest) so the candidate-selection code can penalise routes
+  // that share those nodes with another path.
   std::set<Ipv4Address> nodes;
-
-  RoutingTableEntry destEntry;
-  if (!Lookup(dest, destEntry))
-  {
-    return nodes;
-  }
-
-  Ipv4Address primaryNext = destEntry.nextAddr;
   nodes.insert(dest);
 
-  // Trace from dest backwards toward the first-hop by following topology
-  // entries that all share the same primary next-hop.
   // MAX_PATH_TRACE_HOPS = 32: OLSR networks in UAV swarms rarely exceed
   // ~10 hops, and RFC 3626 recommends a default network diameter of 8.
   // 32 provides ample headroom while bounding worst-case walk time.
@@ -2535,7 +2507,7 @@ RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
   Ipv4Address cur = dest;
   for (int limit = 0; limit < MAX_PATH_TRACE_HOPS; limit++)
   {
-    if (cur == primaryNext)
+    if (cur == firstHop)
     {
       break; // reached the first-hop — nothing further to trace
     }
@@ -2553,7 +2525,7 @@ RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
       {
         continue;
       }
-      if (le.nextAddr == primaryNext)
+      if (le.nextAddr == firstHop)
       {
         nodes.insert(topo.lastAddr);
         cur = topo.lastAddr;
@@ -2567,6 +2539,68 @@ RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
     }
   }
   return nodes;
+}
+
+double
+RoutingProtocol::ComputeTrend(const std::deque<double>& hist) const
+{
+  std::size_t n = hist.size();
+  if (n < 2)
+  {
+    return 0.0;
+  }
+  // Returns a positive value when rewards are degrading (getting lower over
+  // time) and a negative value when they are improving.
+  // hist is ordered oldest→newest (front = oldest, back = newest).
+  return (hist.front() - hist.back()) / static_cast<double>(n - 1);
+}
+
+void
+RoutingProtocol::UpdateMabModel(const Ipv4Address& nextHop,
+                                double instantEtx,
+                                double instantDelay)
+{
+  // Update EWMA delay estimate for this next-hop.
+  double& sd = m_smoothDelay[nextHop];
+  sd = m_mabAlphaD * sd + (1.0 - m_mabAlphaD) * instantDelay;
+
+  // Normalise ETX to [0, 1] using a ceiling of 10.0.
+  // ETX = 1.0 is a perfect link; values above 10.0 are treated as maximum.
+  static constexpr double ETX_CEIL = 10.0;
+  double etxNorm = std::min(1.0, std::max(0.0, (instantEtx - 1.0) / (ETX_CEIL - 1.0)));
+
+  // Normalise delay to [0, 1] using m_dMax.
+  double dNorm = std::min(1.0, std::max(0.0, sd / m_dMax));
+
+  // Combined normalised reward: negative (higher ETX / longer delay → lower).
+  double reward = -(m_rewardAlpha * etxNorm + m_rewardBeta * dNorm);
+
+  MabArm& arm = m_mabArms[nextHop];
+
+  // Sliding window update — evict oldest sample to keep size ≤ m_mabWindow.
+  // The explicit cast to std::size_t avoids an implicit mixed-type comparison.
+  if (arm.window.size() >= static_cast<std::size_t>(m_mabWindow))
+  {
+    arm.window.pop_front();
+  }
+  arm.window.push_back(reward);
+  arm.totalCount++;
+
+  // Reward history for trend detection (last 5 normalised rewards).
+  if (arm.rewardHistory.size() >= 5)
+  {
+    arm.rewardHistory.pop_front();
+  }
+  arm.rewardHistory.push_back(reward);
+
+  NS_LOG_DEBUG("UpdateMabModel: nextHop=" << nextHop
+               << " instantEtx=" << instantEtx
+               << " smoothDelay=" << sd
+               << " etxNorm=" << etxNorm
+               << " dNorm=" << dNorm
+               << " reward=" << reward
+               << " windowSize=" << arm.window.size()
+               << " totalCount=" << arm.totalCount);
 }
 
 void
