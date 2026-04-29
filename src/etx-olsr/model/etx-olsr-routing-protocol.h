@@ -29,6 +29,7 @@
 #include "ns3/timer.h"
 #include "ns3/traced-callback.h"
 #include "ns3/output-stream-wrapper.h"
+#include "ns3/wifi-phy.h"
 
 #include <array>
 #include <deque>
@@ -37,6 +38,11 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+
+// Fast link-failure constants (AOMDV-inspired defaults).
+#define HELLO_INTERVAL 1.0
+#define ALLOWED_HELLO_LOSS 3
+#define NODE_TRAVERSAL_TIME 0.03
 
 namespace ns3
 {
@@ -57,13 +63,15 @@ struct RoutingTableEntry
   uint32_t interface;     //!< Interface index.
   uint32_t distance;      //!< Hop-count distance to the destination.
   double etxDistance;     //!< Cumulative ETX path cost.
+  std::vector<Ipv4Address> nextHops; //!< K candidate next hops from control plane.
 
   RoutingTableEntry()
       : destAddr(),
         nextAddr(),
         interface(0),
         distance(0),
-        etxDistance(0.0)
+        etxDistance(0.0),
+        nextHops()
   {
   }
 };
@@ -83,6 +91,22 @@ struct EtxInfo
       : prr(0.0),
         lastHelloTime(Seconds(0.0)),
         helloInterval(Seconds(2.0))
+  {
+  }
+};
+
+struct LinkNeighbor
+{
+  Ipv4Address neighborAddr;
+  Time lastHeard;
+  bool isLinkUp;
+  uint32_t helloLossCount;
+
+  LinkNeighbor()
+      : neighborAddr(),
+        lastHeard(Seconds(0.0)),
+        isLinkUp(false),
+        helloLossCount(0)
   {
   }
 };
@@ -157,8 +181,21 @@ private:
 
   // ---- ETX state ----
   std::map<Ipv4Address, EtxInfo> m_etxMap;
+  std::map<Ipv4Address, LinkNeighbor> m_linkNeighbors;
   double m_etxAlpha;
   double m_initialEtx;
+  uint32_t m_maxQueueLen;
+  Time m_maxQueueTime;
+
+  struct BufferedPacketEntry
+  {
+    Ptr<Packet> packet;
+    Ipv4Header ipHeader;
+    UnicastForwardCallback ucb;
+    ErrorCallback ecb;
+    Time enqueueTime;
+  };
+  std::deque<BufferedPacketEntry> m_packetQueue;
 
   // ---- Risk-aware routing state ----
   /// Per-next-hop EWMA variance of path-cost prediction error (σ²).
@@ -170,7 +207,7 @@ private:
   /// Risk weight λ: score = V̂ + λ·σ.
   double m_lambda;
 
-  // ---- Phase-1 candidate routing (K=2) ----
+  // ---- Candidate routing (K=3) ----
   struct CandidateRoute
   {
     Ipv4Address nextHop;
@@ -184,30 +221,24 @@ private:
     }
   };
 
-  using CandidateSet = std::array<CandidateRoute, 2>;
+  using CandidateSet = std::array<CandidateRoute, 3>;
   std::map<Ipv4Address, CandidateSet> m_candidateTable;
+  std::map<Ipv4Address, std::array<std::vector<Ipv4Address>, 3>> m_candidatePathTable;
 
-  // ---- MAB (SW-UCB) state for data-plane arm selection ----
-  /**
-   * Per-arm statistics for the Sliding-Window UCB (SW-UCB) bandit.
-   *
-   * The reward for each arm is the **instantaneous** link ETX observed at
-   * forwarding time (a real data-plane measurement), NOT the control-plane
-   * Dijkstra cost.  Only the W most recent rewards are kept, so the bandit
-   * can track non-stationary interference without being anchored to stale
-   * history (solves the non-stationarity problem of vanilla UCB1).
-   *
-   * SW-UCB score: mean(window) + c · sqrt( ln(t) / |window| )
-   *   where t = cumulative total decisions (drives exploration bonus decay)
-   *   and |window| = current window occupancy (≤ W).
-   */
+  // ---- MAB (UCB + trend penalty) state for data-plane arm selection ----
   struct MabArm
   {
-    std::deque<double> window; //!< Sliding window of recent instantaneous rewards.
-    uint64_t totalCount;       //!< Cumulative selection count across all time (drives ln(t)).
+    uint64_t totalCount;             //!< N: cumulative selection count.
+    double meanReward;               //!< mu: running mean reward.
+    double smoothedDelayMs;          //!< EWMA-smoothed data-plane delay (ms).
+    bool hasSmoothedDelay;           //!< Whether delay EWMA has been initialized.
+    std::deque<double> rewardHistory; //!< Latest rewards for trend (size <= 5).
 
     MabArm()
-        : totalCount(0)
+        : totalCount(0),
+          meanReward(0.0),
+          smoothedDelayMs(0.0),
+          hasSmoothedDelay(false)
     {
     }
   };
@@ -216,12 +247,89 @@ private:
   std::map<Ipv4Address, MabArm> m_mabArms;
   /// Total number of data-plane routing decisions made so far (t).
   uint64_t m_mabTotalDecisions;
-  /// SW-UCB exploration constant c (0 disables exploration → pure exploitation).
+  /// UCB exploration constant c.
   double m_mabC;
-  /// Sliding-window size W for SW-UCB; only the W most recent rewards are retained.
-  uint32_t m_mabWindow;
-  /// Extra ETX penalty added when the backup path's penultimate node lies on the primary path.
-  double m_diversityPenalty;
+  /// Trend-penalty coefficient gamma.
+  double m_mabGamma;
+  /// Delay normalization cap D_max in milliseconds.
+  double m_delayMaxMs;
+  /// Maximum allowed delay used for normalized reward.
+  double m_maxAllowedDelayMs;
+  /// Delay EWMA smoothing alpha_d.
+  double m_delayEwmaAlpha;
+  /// ETX normalization base.
+  double m_etxBase;
+  /// Reward alpha for success term.
+  double m_rewardAlpha;
+  /// Reward beta for delay term.
+  double m_rewardBeta;
+  /// Reward weight for SINR risk term.
+  double m_rewardGamma;
+  /// Reward weight for ETX term (1/ETX).
+  double m_rewardDeltaEtx;
+  /// EWMA alpha for reward-value update.
+  double m_rewardEwmaAlpha;
+  /// Soft penalty coefficient P for overlapping backup paths.
+  double m_overlapPenalty;
+  /// EWMA alpha for SINR smoothing.
+  double m_sinrAlpha;
+  /// SINR threshold below which risk becomes infinite.
+  double m_sinrThresholdDb;
+  /// Target linear SINR used for normalized reward.
+  double m_targetSinr;
+  /// Maximum acceptable ETX for robust MPR/control selection.
+  double m_etxThreshold;
+  /// Enable placeholder smart path selector in RouteOutput for A/B experiments.
+  bool m_enableSmartPath;
+  /// RTT threshold (ms) for Fast label.
+  double m_fastRttMs;
+  /// Sliding window (s) with zero drops for Stable label.
+  double m_stableWindowSec;
+  /// Maximum SINR delta (dB) EWMA for Stable label.
+  double m_stableSinrDeltaDb;
+  /// SINR threshold (dB) below which link is considered Noisy.
+  double m_noisySinrDb;
+  /// Sliding window (s) for Noisy-drop detection.
+  double m_noisyDropWindowSec;
+
+  struct LinkState
+  {
+    double smoothSinrDb;
+    double smoothRssiDbm;
+    double smoothSinrDeltaDb;
+    double prevSinrDb;
+    bool hasSinr;
+    bool hasPrevSinr;
+
+    LinkState()
+        : smoothSinrDb(0.0),
+          smoothRssiDbm(0.0),
+          smoothSinrDeltaDb(0.0),
+          prevSinrDb(0.0),
+          hasSinr(false),
+          hasPrevSinr(false)
+    {
+    }
+  };
+
+  std::map<Ipv4Address, LinkState> m_linkState;
+  std::map<uint32_t, Ptr<WifiPhy>> m_wifiPhys;
+  std::map<Ipv4Address, Time> m_neighRealTimeRtt;
+  std::map<Ipv4Address, int64_t> m_lastRttDelta;
+  std::map<Ipv4Address, uint32_t> m_positiveDeltaStreak;
+  std::map<Ipv4Address, std::deque<Time>> m_macTxDropEvents;
+
+  enum NeighborLabel : uint8_t
+  {
+    LABEL_NONE = 0,
+    LABEL_FAST = 1 << 0,
+    LABEL_STABLE = 1 << 1,
+    LABEL_NOISY = 1 << 2
+  };
+
+  // ---- Stability observability ----
+  std::map<Ipv4Address, Ipv4Address> m_lastChosenNextHop;
+  std::deque<Time> m_switchEvents;
 
   // ---- Random variable ----
   Ptr<UniformRandomVariable> m_uniformRandomVariable;
@@ -258,17 +366,47 @@ private:
 
   bool Lookup(const Ipv4Address& dest, RoutingTableEntry& outEntry) const;
   bool FindSendEntry(const RoutingTableEntry& entry, RoutingTableEntry& outEntry) const;
-  bool ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out);
-
-  /**
-   * Build the set of intermediate node addresses on the primary (Dijkstra) path
-   * from this node to @p dest.  Used to detect shared nodes with backup paths.
-   */
-  std::set<Ipv4Address> BuildPrimaryPathNodes(const Ipv4Address& dest) const;
+  bool ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out, uint32_t& pathIndex);
+  void UpdateMabModel(const Ipv4Address& nextHop,
+                      bool isSuccess,
+                      double etxValue,
+                      double rawDelayMs,
+                      double sinrDb);
+  double ComputeTrendPenalty(const MabArm& arm) const;
+  std::set<Ipv4Address> BuildPathNodesForNextHop(const Ipv4Address& dest,
+                                                 const Ipv4Address& firstHop) const;
+  std::vector<Ipv4Address> BuildPathSequenceForNextHop(const Ipv4Address& dest,
+                                                       const Ipv4Address& firstHop) const;
+  double ComputeSinrRisk(const Ipv4Address& nextHop) const;
+  void ResetArmForNextHop(const Ipv4Address& nextHop);
+  void NotifyMonitorSnifferRx(Ptr<const Packet> packet,
+                              uint16_t channelFreqMhz,
+                              WifiTxVector txVector,
+                              MpduInfo aMpdu,
+                              SignalNoiseDbm signalNoise,
+                              uint16_t staId);
+  Ipv4Address ResolveIpv4FromMac(const Address& mac) const;
+  void SetupRttTracer(Ptr<NetDevice> device);
+  void TraceRTTUpdate(Ipv4Address neighAddr, Time newRtt);
+  Ipv4Address SmartPathSelect(Ipv4Address dest);
+  void NotifyMacTxDrop(Ptr<const Packet> packet);
+  void ClearNeighborTelemetry(Ipv4Address neighAddr);
+  uint8_t GetNeighborLabels(Ipv4Address neighAddr) const;
+  void PruneDropEvents(Ipv4Address neighAddr, double windowSec);
 
   // ---- ETX helpers ----
   void UpdateNeighborEtx(const Ipv4Address& neighborIfaceAddr, Time helloInterval);
   double GetLinkEtx(const Ipv4Address& neighborIfaceAddr) const;
+  void UpdateNeighborHeard(const Ipv4Address& neighborAddr);
+  bool FastLinkFailureDetection(const Ipv4Address& neighborAddr, bool linkLayerFeedback);
+  void LinkLayerFeedbackHandler(const Ipv4Address& neighborAddr, bool isSuccess);
+  void TriggerRouteRecalculation(const Ipv4Address& neighborAddr);
+  bool EnqueueBufferedPacket(const Ptr<const Packet>& packet,
+                             const Ipv4Header& header,
+                             const UnicastForwardCallback& ucb,
+                             const ErrorCallback& ecb);
+  void SendBufferedPackets(const Ipv4Address& dst, const Ptr<Ipv4Route>& route);
+  void CleanBufferedPacketQueue();
 
 public:
   // ---- Ipv4RoutingProtocol interface ----
