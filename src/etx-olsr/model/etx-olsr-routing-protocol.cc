@@ -3,7 +3,7 @@
  *
  * Based on the ns-3 OLSR module (src/olsr).
  * Copyright (c) 2004 Francisco J. Ros
- * Copyright (c) 2007 INESC Porto
+ * Copyright (c) 2007 INESC Port
  *
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -27,11 +27,15 @@
 #include "ns3/ipv4-routing-table-entry.h"
 #include "ns3/log.h"
 #include "ns3/names.h"
+#include "ns3/node-list.h"
 #include "ns3/simulator.h"
 #include "ns3/socket-factory.h"
+#include "ns3/tag.h"
 #include "ns3/trace-source-accessor.h"
 #include "ns3/udp-socket-factory.h"
 #include "ns3/uinteger.h"
+#include "ns3/wifi-mac-header.h"
+#include "ns3/wifi-net-device.h"
 
 #include <algorithm>
 #include <cmath>
@@ -66,6 +70,73 @@ NS_LOG_COMPONENT_DEFINE("EtxOlsrRoutingProtocol");
 namespace etxolsr
 {
 
+namespace
+{
+class MyRouteTag : public Tag
+{
+public:
+  static TypeId GetTypeId()
+  {
+    static TypeId tid = TypeId("ns3::etxolsr::MyRouteTag")
+                            .SetParent<Tag>()
+                            .AddConstructor<MyRouteTag>();
+    return tid;
+  }
+
+  TypeId GetInstanceTypeId() const override
+  {
+    return GetTypeId();
+  }
+
+  uint32_t GetSerializedSize() const override
+  {
+    return sizeof(uint32_t) + sizeof(int64_t);
+  }
+
+  void Serialize(TagBuffer i) const override
+  {
+    i.WriteU32(m_pathId);
+    i.WriteU64(static_cast<uint64_t>(m_timestamp.GetNanoSeconds()));
+  }
+
+  void Deserialize(TagBuffer i) override
+  {
+    m_pathId = i.ReadU32();
+    const uint64_t ns = i.ReadU64();
+    m_timestamp = NanoSeconds(static_cast<int64_t>(ns));
+  }
+
+  void Print(std::ostream& os) const override
+  {
+    os << "pathId=" << m_pathId << " ts=" << m_timestamp.GetSeconds();
+  }
+
+  void SetPathId(uint32_t pathId)
+  {
+    m_pathId = pathId;
+  }
+
+  uint32_t GetPathId() const
+  {
+    return m_pathId;
+  }
+
+  void SetTimestamp(Time t)
+  {
+    m_timestamp = t;
+  }
+
+  Time GetTimestamp() const
+  {
+    return m_timestamp;
+  }
+
+private:
+  uint32_t m_pathId{0};
+  Time m_timestamp;
+};
+} // namespace
+
 enum class LinkType : uint8_t
 {
   UNSPEC_LINK = 0,
@@ -95,12 +166,12 @@ RoutingProtocol::GetTypeId()
           .AddConstructor<RoutingProtocol>()
           .AddAttribute("HelloInterval",
                         "HELLO messages emission interval.",
-                        TimeValue(Seconds(2)),
+                        TimeValue(Seconds(0.5)),
                         MakeTimeAccessor(&RoutingProtocol::m_helloInterval),
                         MakeTimeChecker())
           .AddAttribute("TcInterval",
                         "TC messages emission interval.",
-                        TimeValue(Seconds(5)),
+                        TimeValue(Seconds(1)),
                         MakeTimeAccessor(&RoutingProtocol::m_tcInterval),
                         MakeTimeChecker())
           .AddAttribute("MidInterval",
@@ -151,28 +222,125 @@ RoutingProtocol::GetTypeId()
                         MakeDoubleAccessor(&RoutingProtocol::m_lambda),
                         MakeDoubleChecker<double>(0.0))
           .AddAttribute("MabC",
-                        "SW-UCB exploration constant c for MAB-based data-plane candidate "
-                        "selection. score = mean(window) + c·sqrt(ln(t)/|window|). "
-                        "Set to 0 to disable exploration (pure exploitation).",
+                        "UCB exploration constant c. score = mu + c*sqrt(ln(t)/N) - gamma*trend.",
                         DoubleValue(1.0),
                         MakeDoubleAccessor(&RoutingProtocol::m_mabC),
                         MakeDoubleChecker<double>(0.0))
-          .AddAttribute("MabWindow",
-                        "Sliding-window size W for SW-UCB reward tracking. "
-                        "Only the W most recent data-plane rewards influence "
-                        "the arm mean and exploration bonus, allowing the "
-                        "bandit to adapt to non-stationary jamming.",
-                        UintegerValue(20),
-                        MakeUintegerAccessor(&RoutingProtocol::m_mabWindow),
-                        MakeUintegerChecker<uint32_t>(1))
-          .AddAttribute("DiversityPenalty",
-                        "Extra ETX cost added to backup-path candidates whose "
-                        "penultimate node also lies on the primary path "
-                        "(node-disjoint diversity approximation). Higher values "
-                        "push the backup toward a more topologically diverse route.",
-                        DoubleValue(2.0),
-                        MakeDoubleAccessor(&RoutingProtocol::m_diversityPenalty),
+          .AddAttribute("MabGamma",
+                        "Trend penalty coefficient gamma in UCB score.",
+                        DoubleValue(0.3),
+                        MakeDoubleAccessor(&RoutingProtocol::m_mabGamma),
                         MakeDoubleChecker<double>(0.0))
+          .AddAttribute("DelayMaxMs",
+                        "Delay normalization cap D_max in milliseconds.",
+                        DoubleValue(100.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_delayMaxMs),
+                        MakeDoubleChecker<double>(1.0))
+          .AddAttribute("MaxAllowedDelayMs",
+                        "Maximum allowed delay for normalized reward.",
+                        DoubleValue(100.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_maxAllowedDelayMs),
+                        MakeDoubleChecker<double>(1.0))
+          .AddAttribute("DelayEwmaAlpha",
+                        "EWMA alpha_d for delay smoothing: D_s = alpha_d*D_old + (1-alpha_d)*D_new.",
+                        DoubleValue(0.8),
+                        MakeDoubleAccessor(&RoutingProtocol::m_delayEwmaAlpha),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("EtxBase",
+                        "ETX normalization base.",
+                        DoubleValue(1.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_etxBase),
+                        MakeDoubleChecker<double>(0.1))
+          .AddAttribute("RewardAlpha",
+                        "Reward alpha for success term.",
+                        DoubleValue(0.6),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardAlpha),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("RewardBeta",
+                        "Reward beta for delay term.",
+                        DoubleValue(0.4),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardBeta),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("RewardGamma",
+                        "Reward gamma for SINR risk term.",
+                        DoubleValue(0.2),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardGamma),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("RewardDeltaEtx",
+                        "Reward delta for ETX term: 1/max(1,ETX).",
+                        DoubleValue(0.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardDeltaEtx),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("RewardEwmaAlpha",
+                        "EWMA alpha for reward-value update.",
+                        DoubleValue(0.2),
+                        MakeDoubleAccessor(&RoutingProtocol::m_rewardEwmaAlpha),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("OverlapPenalty",
+                        "Soft overlap penalty P for backup path selection.",
+                        DoubleValue(80.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_overlapPenalty),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("SinrAlpha",
+                        "EWMA alpha for smoothing SINR samples.",
+                        DoubleValue(0.8),
+                        MakeDoubleAccessor(&RoutingProtocol::m_sinrAlpha),
+                        MakeDoubleChecker<double>(0.0, 1.0))
+          .AddAttribute("SinrThresholdDb",
+                        "SINR threshold in dB below which risk becomes infinite.",
+                        DoubleValue(5.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_sinrThresholdDb),
+                        MakeDoubleChecker<double>())
+          .AddAttribute("TargetSinr",
+                        "Target linear SINR used for normalized reward.",
+                        DoubleValue(10.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_targetSinr),
+                        MakeDoubleChecker<double>(0.1))
+          .AddAttribute("EtxThreshold",
+                        "Maximum ETX accepted for robust MPR/control selection.",
+                        DoubleValue(1.5),
+                        MakeDoubleAccessor(&RoutingProtocol::m_etxThreshold),
+                        MakeDoubleChecker<double>(1.0))
+          .AddAttribute("EnableSmartPath",
+                        "Enable placeholder smart-path selection in RouteOutput.",
+                        BooleanValue(false),
+                        MakeBooleanAccessor(&RoutingProtocol::m_enableSmartPath),
+                        MakeBooleanChecker())
+          .AddAttribute("FastRttMs",
+                        "RTT threshold in milliseconds for Fast neighbor label.",
+                        DoubleValue(10.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_fastRttMs),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("StableWindowSec",
+                        "Sliding window in seconds with zero drops for Stable label.",
+                        DoubleValue(10.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_stableWindowSec),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("StableSinrDeltaDb",
+                        "Maximum EWMA SINR delta (dB) for Stable label.",
+                        DoubleValue(2.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_stableSinrDeltaDb),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("NoisySinrDb",
+                        "SINR threshold (dB) below which link is tagged Noisy.",
+                        DoubleValue(5.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_noisySinrDb),
+                        MakeDoubleChecker<double>())
+          .AddAttribute("NoisyDropWindowSec",
+                        "Sliding window in seconds to tag Noisy based on MacTxDrop events.",
+                        DoubleValue(2.0),
+                        MakeDoubleAccessor(&RoutingProtocol::m_noisyDropWindowSec),
+                        MakeDoubleChecker<double>(0.0))
+          .AddAttribute("MaxQueueLen",
+                        "Maximum number of packets in ETX-OLSR micro buffer queue.",
+                        UintegerValue(32),
+                        MakeUintegerAccessor(&RoutingProtocol::m_maxQueueLen),
+                        MakeUintegerChecker<uint32_t>(1))
+          .AddAttribute("MaxQueueTime",
+                        "Maximum buffering time for a queued packet before drop.",
+                        TimeValue(Seconds(1.0)),
+                        MakeTimeAccessor(&RoutingProtocol::m_maxQueueTime),
+                        MakeTimeChecker())
           .AddTraceSource("Rx",
                           "Receive ETX-OLSR packet.",
                           MakeTraceSourceAccessor(&RoutingProtocol::m_rxPacketTrace),
@@ -202,8 +370,29 @@ RoutingProtocol::RoutingProtocol()
       m_lambda(1.0),
       m_mabTotalDecisions(0),
       m_mabC(1.0),
-      m_mabWindow(20),
-      m_diversityPenalty(2.0)
+      m_mabGamma(0.3),
+      m_delayMaxMs(100.0),
+      m_maxAllowedDelayMs(100.0),
+      m_delayEwmaAlpha(0.8),
+      m_etxBase(1.0),
+      m_rewardAlpha(0.6),
+      m_rewardBeta(0.4),
+      m_rewardGamma(0.2),
+      m_rewardDeltaEtx(0.0),
+      m_rewardEwmaAlpha(0.2),
+      m_sinrAlpha(0.8),
+      m_sinrThresholdDb(5.0),
+      m_targetSinr(10.0),
+      m_etxThreshold(1.5),
+      m_enableSmartPath(false),
+      m_fastRttMs(10.0),
+      m_stableWindowSec(10.0),
+      m_stableSinrDeltaDb(2.0),
+      m_noisySinrDb(5.0),
+      m_noisyDropWindowSec(2.0),
+      m_overlapPenalty(80.0),
+      m_maxQueueLen(32),
+      m_maxQueueTime(Seconds(1.0))
 {
   m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
   m_hnaRoutingTable = Create<Ipv4StaticRouting>();
@@ -265,6 +454,10 @@ RoutingProtocol::DoDispose()
   m_sigma.clear();
   m_prevCandCost.clear();
   m_mabArms.clear();
+  m_neighRealTimeRtt.clear();
+  m_lastRttDelta.clear();
+  m_positiveDeltaStreak.clear();
+  m_macTxDropEvents.clear();
 
   Ipv4RoutingProtocol::DoDispose();
 }
@@ -501,6 +694,156 @@ RoutingProtocol::GetLinkEtx(const Ipv4Address& neighborIfaceAddr) const
 }
 
 void
+RoutingProtocol::UpdateNeighborHeard(const Ipv4Address& neighborAddr)
+{
+  LinkNeighbor& info = m_linkNeighbors[neighborAddr];
+  info.neighborAddr = neighborAddr;
+  info.lastHeard = Simulator::Now();
+  info.isLinkUp = true;
+  info.helloLossCount = 0;
+}
+
+bool
+RoutingProtocol::FastLinkFailureDetection(const Ipv4Address& neighborAddr, bool linkLayerFeedback)
+{
+  if (!linkLayerFeedback)
+  {
+    auto it = m_linkNeighbors.find(neighborAddr);
+    if (it != m_linkNeighbors.end())
+    {
+      it->second.isLinkUp = false;
+      it->second.helloLossCount = ALLOWED_HELLO_LOSS + 1;
+    }
+    NS_LOG_WARN("FastLinkFailure: link-layer failure for neighbor " << neighborAddr);
+    return false;
+  }
+
+  auto it = m_linkNeighbors.find(neighborAddr);
+  if (it == m_linkNeighbors.end())
+  {
+    return false;
+  }
+
+  const Time linkTimeout = Seconds(ALLOWED_HELLO_LOSS * HELLO_INTERVAL);
+  const Time now = Simulator::Now();
+  if (now - it->second.lastHeard > linkTimeout)
+  {
+    it->second.isLinkUp = false;
+    it->second.helloLossCount++;
+    NS_LOG_WARN("FastLinkFailure: neighbor timeout " << neighborAddr
+                                                     << " helloLossCount="
+                                                     << it->second.helloLossCount);
+    return false;
+  }
+
+  it->second.isLinkUp = true;
+  it->second.helloLossCount = 0;
+  return true;
+}
+
+void
+RoutingProtocol::LinkLayerFeedbackHandler(const Ipv4Address& neighborAddr, bool isSuccess)
+{
+  if (isSuccess)
+  {
+    UpdateNeighborHeard(neighborAddr);
+  }
+
+  if (!FastLinkFailureDetection(neighborAddr, isSuccess))
+  {
+    TriggerRouteRecalculation(neighborAddr);
+  }
+}
+
+void
+RoutingProtocol::TriggerRouteRecalculation(const Ipv4Address& neighborAddr)
+{
+  NS_LOG_DEBUG("TriggerRouteRecalculation due to neighbor " << neighborAddr);
+  m_state.EraseTwoHopNeighborTuples(GetMainAddress(neighborAddr));
+  m_state.EraseMprSelectorTuples(GetMainAddress(neighborAddr));
+  MprComputation();
+  RoutingTableComputation();
+}
+
+void
+RoutingProtocol::CleanBufferedPacketQueue()
+{
+  const Time now = Simulator::Now();
+  auto it = m_packetQueue.begin();
+  while (it != m_packetQueue.end())
+  {
+    if ((now - it->enqueueTime) > m_maxQueueTime)
+    {
+      if (!it->ecb.IsNull())
+      {
+        it->ecb(it->packet, it->ipHeader, Socket::ERROR_NOROUTETOHOST);
+      }
+      it = m_packetQueue.erase(it);
+      continue;
+    }
+    ++it;
+  }
+}
+
+bool
+RoutingProtocol::EnqueueBufferedPacket(const Ptr<const Packet>& packet,
+                                       const Ipv4Header& header,
+                                       const UnicastForwardCallback& ucb,
+                                       const ErrorCallback& ecb)
+{
+  if (!packet)
+  {
+    return false;
+  }
+
+  CleanBufferedPacketQueue();
+  if (m_packetQueue.size() >= m_maxQueueLen)
+  {
+    BufferedPacketEntry drop = m_packetQueue.front();
+    if (!drop.ecb.IsNull())
+    {
+      drop.ecb(drop.packet, drop.ipHeader, Socket::ERROR_NOROUTETOHOST);
+    }
+    m_packetQueue.pop_front();
+  }
+
+  BufferedPacketEntry entry;
+  entry.packet = packet->Copy();
+  entry.ipHeader = header;
+  entry.ucb = ucb;
+  entry.ecb = ecb;
+  entry.enqueueTime = Simulator::Now();
+  m_packetQueue.push_back(entry);
+  return true;
+}
+
+void
+RoutingProtocol::SendBufferedPackets(const Ipv4Address& dst, const Ptr<Ipv4Route>& route)
+{
+  CleanBufferedPacketQueue();
+  if (!route)
+  {
+    return;
+  }
+
+  auto it = m_packetQueue.begin();
+  while (it != m_packetQueue.end())
+  {
+    if (it->ipHeader.GetDestination() != dst)
+    {
+      ++it;
+      continue;
+    }
+
+    if (!it->ucb.IsNull() && it->packet)
+    {
+      it->ucb(route, it->packet->Copy(), it->ipHeader);
+    }
+    it = m_packetQueue.erase(it);
+  }
+}
+
+void
 RoutingProtocol::RecvOlsr(Ptr<Socket> socket)
 {
   Ptr<Packet> receivedPacket;
@@ -590,6 +933,7 @@ RoutingProtocol::RecvOlsr(Ptr<Socket> socket)
                      << " ETX-OLSR node " << m_mainAddress
                      << " received HELLO message of size "
                      << messageHeader.GetSerializedSize());
+        UpdateNeighborHeard(senderIfaceAddr);
         UpdateNeighborEtx(senderIfaceAddr, messageHeader.GetHello().GetHTime());
         ProcessHello(messageHeader, receiverIfaceAddr, senderIfaceAddr);
         break;
@@ -738,6 +1082,19 @@ RoutingProtocol::MprComputation()
     {
       if (nb_tuple->status != olsr::NeighborTuple::STATUS_SYM ||
           nb_tuple->willingness == olsr::Willingness::NEVER)
+      {
+        continue;
+      }
+
+      double linkEtx = std::numeric_limits<double>::infinity();
+      for (const auto& link : m_state.GetLinks())
+      {
+        if (GetMainAddress(link.neighborIfaceAddr) == nb_tuple->neighborMainAddr)
+        {
+          linkEtx = std::min(linkEtx, GetLinkEtx(link.neighborIfaceAddr));
+        }
+      }
+      if (linkEtx > m_etxThreshold)
       {
         continue;
       }
@@ -1013,8 +1370,10 @@ RoutingProtocol::RoutingTableComputation()
     }
   }
 
-  // ---------------- Phase-1 candidate table (K=2) ----------------
+  // ---------------- Candidate table (K=3 from pure ETX control plane) ----------------
+  const auto oldCandidatePathTable = m_candidatePathTable;
   m_candidateTable.clear();
+  m_candidatePathTable.clear();
   const olsr::TopologySet& topology = m_state.GetTopologySet();
 
   for (const auto& kv : m_table)
@@ -1022,19 +1381,31 @@ RoutingProtocol::RoutingTableComputation()
     const Ipv4Address dest = kv.first;
     const RoutingTableEntry& primaryEntry = kv.second;
 
-    CandidateSet cset;
+    CandidateSet cset{};
+    std::array<std::vector<Ipv4Address>, 3> pathSet;
     cset[0].nextHop = primaryEntry.nextAddr;
     cset[0].interface = primaryEntry.interface;
     cset[0].ctrlCost = primaryEntry.etxDistance;
 
-    // Node-disjoint diversity: build the set of intermediate nodes on the
-    // primary path so we can penalise backup routes that share those nodes.
-    const std::set<Ipv4Address> primaryNodes = BuildPrimaryPathNodes(dest);
+    struct NextHopCandidate
+    {
+      Ipv4Address nextHop;
+      uint32_t iface;
+      double baseCost;
+      std::set<std::pair<Ipv4Address, Ipv4Address>> pathEdges;
+    };
+    std::vector<NextHopCandidate> pool;
 
-    Ipv4Address backupNext;
-    uint32_t backupIf = 0;
-    double backupCost = std::numeric_limits<double>::infinity();
-    double backupRiskScore = std::numeric_limits<double>::infinity();
+    NextHopCandidate primaryCand;
+    primaryCand.nextHop = cset[0].nextHop;
+    primaryCand.iface = cset[0].interface;
+    primaryCand.baseCost = cset[0].ctrlCost;
+    pathSet[0] = BuildPathSequenceForNextHop(dest, cset[0].nextHop);
+    for (std::size_t ei = 0; ei + 1 < pathSet[0].size(); ++ei)
+    {
+      primaryCand.pathEdges.insert(std::make_pair(pathSet[0][ei], pathSet[0][ei + 1]));
+    }
+    pool.push_back(primaryCand);
 
     for (const auto& topo : topology)
     {
@@ -1042,108 +1413,173 @@ RoutingProtocol::RoutingTableComputation()
       {
         continue;
       }
-
       RoutingTableEntry lastEntry;
       if (!Lookup(topo.lastAddr, lastEntry))
       {
         continue;
       }
-
-      Ipv4Address candNext = lastEntry.nextAddr;
-      if (candNext == cset[0].nextHop)
+      const Ipv4Address candNext = lastEntry.nextAddr;
+      bool exists = false;
+      for (const auto& e : pool)
+      {
+        if (e.nextHop == candNext)
+        {
+          exists = true;
+          break;
+        }
+      }
+      if (exists)
       {
         continue;
       }
-
-      double candCost = lastEntry.etxDistance + m_initialEtx;
-
-      // Risk-aware backup scoring: penalise variance of the backup first-hop.
-      double candSigma = 0.0;
+      NextHopCandidate cand;
+      cand.nextHop = candNext;
+      cand.iface = lastEntry.interface;
+      cand.baseCost = lastEntry.etxDistance + m_initialEtx;
+      const auto seq = BuildPathSequenceForNextHop(dest, candNext);
+      for (std::size_t ei = 0; ei + 1 < seq.size(); ++ei)
       {
-        auto sigIt = m_sigma.find(candNext);
-        if (sigIt != m_sigma.end())
+        cand.pathEdges.insert(std::make_pair(seq[ei], seq[ei + 1]));
+      }
+      pool.push_back(cand);
+    }
+
+    std::vector<NextHopCandidate> selected;
+    selected.push_back(primaryCand);
+    cset[1] = cset[0];
+    cset[2] = cset[0];
+
+    for (int idx = 1; idx < 3; ++idx)
+    {
+      // "Political correctness" constraints:
+      // - idx=1: prefer Stable neighbors
+      // - idx=2: avoid Noisy neighbors
+      const bool requireStable = (idx == 1);
+      const bool avoidNoisy = (idx == 2);
+
+      const double pruneWin = std::max(m_stableWindowSec, m_noisyDropWindowSec);
+      for (const auto& c : pool)
+      {
+        PruneDropEvents(c.nextHop, pruneWin);
+      }
+
+      double bestCost = std::numeric_limits<double>::infinity();
+      int bestPoolIndex = -1;
+
+      // Two-pass selection: if strict constraint yields no candidate, fall back to soft.
+      const int passes = 2;
+      for (int pass = 0; pass < passes && bestPoolIndex < 0; ++pass)
+      {
+        const bool strict = (pass == 0);
+
+        for (int pi = 0; pi < static_cast<int>(pool.size()); ++pi)
         {
-          candSigma = std::sqrt(sigIt->second);
+          const auto& cand = pool[pi];
+          bool already = false;
+          for (const auto& sel : selected)
+          {
+            if (sel.nextHop == cand.nextHop)
+            {
+              already = true;
+              break;
+            }
+          }
+          if (already)
+          {
+            continue;
+          }
+
+          const uint8_t labels = GetNeighborLabels(cand.nextHop);
+          if (strict && requireStable && ((labels & LABEL_STABLE) == 0))
+          {
+            continue;
+          }
+          if (strict && avoidNoisy && ((labels & LABEL_NOISY) != 0))
+          {
+            continue;
+          }
+
+          double penaltySum = 0.0;
+          for (const auto& sel : selected)
+          {
+            if (cand.pathEdges.empty())
+            {
+              continue;
+            }
+            uint32_t overlap = 0;
+            for (const auto& e : cand.pathEdges)
+            {
+              if (sel.pathEdges.count(e) > 0)
+              {
+                overlap++;
+              }
+            }
+            const double overlapRatio =
+                static_cast<double>(overlap) / static_cast<double>(cand.pathEdges.size());
+            penaltySum += m_overlapPenalty * overlapRatio;
+          }
+
+          // Soft preference: penalize Noisy candidates even if we had to fall back.
+          if (!strict && avoidNoisy && ((labels & LABEL_NOISY) != 0))
+          {
+            penaltySum += 1e6;
+          }
+
+          const double softCost = cand.baseCost + penaltySum;
+          if (softCost < bestCost)
+          {
+            bestCost = softCost;
+            bestPoolIndex = pi;
+          }
         }
       }
-      double riskScore = candCost + m_lambda * candSigma;
 
-      // Diversity penalty: if the backup's penultimate node is also on the
-      // primary path, the two routes share intermediate infrastructure and
-      // offer no real redundancy.  Add an extra cost to push selection toward
-      // a more topologically disjoint alternative.
-      if (!primaryNodes.empty() && primaryNodes.count(topo.lastAddr) > 0)
+      if (bestPoolIndex >= 0)
       {
-        riskScore += m_diversityPenalty;
+        const auto& chosenCand = pool[bestPoolIndex];
+        cset[idx].nextHop = chosenCand.nextHop;
+        cset[idx].interface = chosenCand.iface;
+        cset[idx].ctrlCost = bestCost;
+        pathSet[idx] = BuildPathSequenceForNextHop(dest, chosenCand.nextHop);
+        selected.push_back(chosenCand);
       }
-
-      if (riskScore < backupRiskScore)
-      {
-        backupRiskScore = riskScore;
-        backupCost = candCost;
-        backupNext = candNext;
-        backupIf = lastEntry.interface;
-      }
-    }
-
-    if (backupNext != Ipv4Address())
-    {
-      cset[1].nextHop = backupNext;
-      cset[1].interface = backupIf;
-      cset[1].ctrlCost = backupCost;
-    }
-    else
-    {
-      cset[1] = cset[0];
     }
 
     m_candidateTable[dest] = cset;
+    m_candidatePathTable[dest] = pathSet;
+    auto tableIt = m_table.find(dest);
+    if (tableIt != m_table.end())
+    {
+      tableIt->second.nextHops.clear();
+      for (const auto& cand : cset)
+      {
+        if (cand.nextHop != Ipv4Address() &&
+            std::find(tableIt->second.nextHops.begin(), tableIt->second.nextHops.end(), cand.nextHop) ==
+                tableIt->second.nextHops.end())
+        {
+          tableIt->second.nextHops.push_back(cand.nextHop);
+        }
+      }
+    }
+
+    auto oldPathsIt = oldCandidatePathTable.find(dest);
+    if (oldPathsIt != oldCandidatePathTable.end())
+    {
+      for (std::size_t idx = 0; idx < pathSet.size(); ++idx)
+      {
+        if (oldPathsIt->second[idx] != pathSet[idx] && cset[idx].nextHop != Ipv4Address())
+        {
+          ResetArmForNextHop(cset[idx].nextHop);
+        }
+      }
+    }
 
     NS_LOG_DEBUG("CandidateTable: dest=" << dest
-                  << " primary=" << cset[0].nextHop
-                  << " backup=" << cset[1].nextHop);
+                  << " p1=" << cset[0].nextHop
+                  << " p2=" << cset[1].nextHop
+                  << " p3=" << cset[2].nextHop);
   }
 
-  // ---- Risk-aware: update per-next-hop variance σ² (Control-Plane timescale) ----
-  // For every candidate next-hop that appears in the table, compare the current
-  // path-cost estimate (V̂) against the previously stored value.  The squared
-  // prediction error drives an EWMA variance estimate:
-  //   e  = ctrlCost_now - ctrlCost_prev
-  //   σ² ← (1-β)·σ² + β·e²
-  for (const auto& kv : m_candidateTable)
-  {
-    const CandidateSet& cset = kv.second;
-    for (std::size_t k = 0; k < cset.size(); k++)
-    {
-      const CandidateRoute& cand = cset[k];
-      if (cand.nextHop == Ipv4Address() || std::isinf(cand.ctrlCost))
-      {
-        continue;
-      }
-
-      auto prevIt = m_prevCandCost.find(cand.nextHop);
-      // On the first observation for a next-hop, prevCost == ctrlCost, so error = 0
-      // and σ² remains at its initial value of 0.  Variance warms up from the second
-      // routing-table computation onwards (cold-start by design).
-      double prevCost = (prevIt != m_prevCandCost.end()) ? prevIt->second : cand.ctrlCost;
-
-      double error = cand.ctrlCost - prevCost;
-      double prevSigma = 0.0;
-      auto sigIt = m_sigma.find(cand.nextHop);
-      if (sigIt != m_sigma.end())
-      {
-        prevSigma = sigIt->second;
-      }
-      double newSigma = (1.0 - m_beta) * prevSigma + m_beta * error * error;
-      m_sigma[cand.nextHop] = newSigma;
-      m_prevCandCost[cand.nextHop] = cand.ctrlCost;
-
-      NS_LOG_DEBUG("Sigma update: nextHop=" << cand.nextHop
-                   << " cost=" << cand.ctrlCost
-                   << " error=" << error
-                   << " sigma=" << std::sqrt(newSigma));
-    }
-  }
   // ---------------- end candidate table ----------------
 
   NS_LOG_DEBUG("Node " << m_mainAddress << ": ETX RoutingTableComputation end. "
@@ -1817,6 +2253,18 @@ RoutingProtocol::PopulateMprSelectorSet(const olsr::MessageHeader& msg,
                                        const olsr::MessageHeader::Hello& hello)
 {
   Time now = Simulator::Now();
+  double senderEtx = std::numeric_limits<double>::infinity();
+  for (const auto& link : m_state.GetLinks())
+  {
+    if (GetMainAddress(link.neighborIfaceAddr) == msg.GetOriginatorAddress())
+    {
+      senderEtx = std::min(senderEtx, GetLinkEtx(link.neighborIfaceAddr));
+    }
+  }
+  if (senderEtx > m_etxThreshold)
+  {
+    return;
+  }
 
   for (auto linkMessage = hello.linkMessages.begin(); linkMessage != hello.linkMessages.end();
        linkMessage++)
@@ -1856,6 +2304,7 @@ RoutingProtocol::PopulateMprSelectorSet(const olsr::MessageHeader& msg,
 void
 RoutingProtocol::NeighborLoss(const olsr::LinkTuple& tuple)
 {
+  LinkLayerFeedbackHandler(tuple.neighborIfaceAddr, false);
   NS_LOG_DEBUG(Simulator::Now().As(Time::S) << ": ETX-OLSR Node " << m_mainAddress
                                             << " LinkTuple " << tuple.neighborIfaceAddr
                                             << " -> neighbor loss.");
@@ -2004,6 +2453,7 @@ RoutingProtocol::LinkTupleTimerExpire(Ipv4Address neighborIfaceAddr)
   }
   if (tuple->time < now)
   {
+    ClearNeighborTelemetry(neighborIfaceAddr);
     RemoveLinkTuple(*tuple);
   }
   else if (tuple->symTime < now)
@@ -2184,7 +2634,7 @@ RoutingProtocol::FindSendEntry(const RoutingTableEntry& entry, RoutingTableEntry
 }
 
 bool
-RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
+RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out, uint32_t& pathIndex)
 {
   auto it = m_candidateTable.find(dest);
   if (it == m_candidateTable.end())
@@ -2224,23 +2674,6 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
     return false;
   };
 
-  // MAB (SW-UCB) selection — Data-Plane timescale.
-  //
-  // Two-timescale architecture:
-  //   Control plane (slow): computes μ + λσ for candidate ranking (backup selection).
-  //   Data plane   (fast) : SW-UCB selects the arm to forward through; reward comes
-  //                         from the *instantaneous* link ETX of the chosen next-hop,
-  //                         which reflects real-time PRR observed on HELLO packets —
-  //                         a true data-plane measurement independent of Dijkstra.
-  //
-  // SW-UCB score: score_a = mean(window_a) + c · sqrt( ln(t) / |window_a| )
-  //   window_a  = sliding window of the W most recent instantaneous rewards
-  //   |window_a| = current occupancy of the window (≤ W = m_mabWindow)
-  //   t          = m_mabTotalDecisions + 1  (cumulative; keeps ln(t) ≥ 0)
-  //   c          = m_mabC (exploration constant)
-  //
-  // Arms with an empty window receive score = +∞ (always explored first).
-
   const double negInf = -std::numeric_limits<double>::infinity();
   double bestScore = negInf;
   int bestK = -1;
@@ -2259,30 +2692,19 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
     auto armIt = m_mabArms.find(cand.nextHop);
 
     double ucbScore;
-    if (armIt == m_mabArms.end() || armIt->second.window.empty())
+    if (armIt == m_mabArms.end() || armIt->second.totalCount == 0)
     {
-      // Cold-start: unvisited arm — always explore first.
+      // N=0 -> +inf
       ucbScore = std::numeric_limits<double>::infinity();
     }
     else
     {
       const MabArm& arm = armIt->second;
-      std::size_t w = arm.window.size();
-
-      // Compute window mean over the W most recent data-plane rewards.
-      double windowMean = 0.0;
-      for (const double r : arm.window)
-      {
-        windowMean += r;
-      }
-      windowMean /= static_cast<double>(w);
-
-      // Exploration bonus: use window occupancy as denominator so the bonus
-      // rises quickly after a topology change clears old window entries.
-      double exploration = (m_mabC > 0.0)
-                               ? m_mabC * std::sqrt(logT / static_cast<double>(w))
-                               : 0.0;
-      ucbScore = windowMean + exploration;
+      const double exploration =
+          (m_mabC > 0.0) ? m_mabC * std::sqrt(logT / static_cast<double>(arm.totalCount)) : 0.0;
+      const double trend = ComputeTrendPenalty(arm);
+      const double sigma = std::sqrt(std::max(0.0, m_sigma[cand.nextHop]));
+      ucbScore = arm.meanReward + exploration - m_mabGamma * trend - sigma;
     }
 
     if (ucbScore > bestScore)
@@ -2295,38 +2717,27 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
   if (bestK >= 0)
   {
     out = cset[bestK];
+    pathIndex = static_cast<uint32_t>(bestK);
     m_mabTotalDecisions++;
 
-    // ---- Data-plane reward (real observation) ----
-    // Use the *instantaneous* ETX of the chosen next-hop's direct link.
-    // This is derived from the live PRR maintained via HELLO reception:
-    // a genuine physical-layer measurement that changes with interference
-    // and mobility, independent of the control-plane Dijkstra path cost.
-    //
-    // GetLinkEtx is always well-defined: it returns m_initialEtx for
-    // links not yet seen, and 1/prr (clamped to [1, 100]) for known links.
-    // instantReward is therefore always in the range [-100, -1].
-    double instantReward = -GetLinkEtx(out.nextHop);
-
-    MabArm& arm = m_mabArms[out.nextHop];
-    // Evict the oldest sample before inserting the new one so the window
-    // never holds more than m_mabWindow entries (invariant: size ≤ W).
-    // m_mabWindow is uint32_t; the explicit cast to std::size_t avoids an
-    // implicit mixed-type comparison with deque::size_type.
-    if (arm.window.size() >= static_cast<std::size_t>(m_mabWindow))
+    auto prevIt = m_lastChosenNextHop.find(dest);
+    if (prevIt != m_lastChosenNextHop.end() && prevIt->second != out.nextHop)
     {
-      arm.window.pop_front();
+      m_switchEvents.push_back(Simulator::Now());
     }
-    arm.window.push_back(instantReward);
-    arm.totalCount++;
+    m_lastChosenNextHop[dest] = out.nextHop;
+    while (!m_switchEvents.empty() &&
+           (Simulator::Now() - m_switchEvents.front()).GetSeconds() > 1.0)
+    {
+      m_switchEvents.pop_front();
+    }
+    const double switchPerSec = static_cast<double>(m_switchEvents.size());
 
-    NS_LOG_DEBUG("ChooseCandidate (SW-UCB): dest=" << dest
+    NS_LOG_DEBUG("ChooseCandidate (UCB): dest=" << dest
                  << " k=" << bestK
                  << " nextHop=" << out.nextHop
                  << " ucbScore=" << bestScore
-                 << " instantReward=" << instantReward
-                 << " windowSize=" << arm.window.size()
-                 << " totalCount=" << arm.totalCount
+                 << " switchPerSec=" << switchPerSec
                  << " t=" << m_mabTotalDecisions);
     return true;
   }
@@ -2336,35 +2747,21 @@ RoutingProtocol::ChooseCandidate(const Ipv4Address& dest, CandidateRoute& out)
 }
 
 std::set<Ipv4Address>
-RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
+RoutingProtocol::BuildPathNodesForNextHop(const Ipv4Address& dest, const Ipv4Address& firstHop) const
 {
-  // Walk the primary (Dijkstra) path from this node to dest by chasing
-  // topology entries that share the same first-hop as the primary route.
-  // Returns the set of intermediate addresses (including dest) so the
-  // backup-selection code can penalise routes that share those nodes.
   std::set<Ipv4Address> nodes;
-
-  RoutingTableEntry destEntry;
-  if (!Lookup(dest, destEntry))
+  if (firstHop == Ipv4Address())
   {
     return nodes;
   }
-
-  Ipv4Address primaryNext = destEntry.nextAddr;
   nodes.insert(dest);
-
-  // Trace from dest backwards toward the first-hop by following topology
-  // entries that all share the same primary next-hop.
-  // MAX_PATH_TRACE_HOPS = 32: OLSR networks in UAV swarms rarely exceed
-  // ~10 hops, and RFC 3626 recommends a default network diameter of 8.
-  // 32 provides ample headroom while bounding worst-case walk time.
   static constexpr int MAX_PATH_TRACE_HOPS = 32;
   Ipv4Address cur = dest;
   for (int limit = 0; limit < MAX_PATH_TRACE_HOPS; limit++)
   {
-    if (cur == primaryNext)
+    if (cur == firstHop)
     {
-      break; // reached the first-hop — nothing further to trace
+      break;
     }
 
     const olsr::TopologySet& topology = m_state.GetTopologySet();
@@ -2380,7 +2777,7 @@ RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
       {
         continue;
       }
-      if (le.nextAddr == primaryNext)
+      if (le.nextAddr == firstHop)
       {
         nodes.insert(topo.lastAddr);
         cur = topo.lastAddr;
@@ -2394,6 +2791,188 @@ RoutingProtocol::BuildPrimaryPathNodes(const Ipv4Address& dest) const
     }
   }
   return nodes;
+}
+
+std::vector<Ipv4Address>
+RoutingProtocol::BuildPathSequenceForNextHop(const Ipv4Address& dest, const Ipv4Address& firstHop) const
+{
+  std::vector<Ipv4Address> sequence;
+  if (firstHop == Ipv4Address())
+  {
+    return sequence;
+  }
+
+  sequence.push_back(firstHop);
+  if (dest == firstHop)
+  {
+    return sequence;
+  }
+
+  static constexpr int MAX_PATH_TRACE_HOPS = 32;
+  Ipv4Address cur = dest;
+  std::vector<Ipv4Address> reverseTail;
+  reverseTail.push_back(dest);
+  for (int limit = 0; limit < MAX_PATH_TRACE_HOPS; ++limit)
+  {
+    if (cur == firstHop)
+    {
+      break;
+    }
+
+    bool advanced = false;
+    for (const auto& topo : m_state.GetTopologySet())
+    {
+      if (topo.destAddr != cur)
+      {
+        continue;
+      }
+      RoutingTableEntry le;
+      if (!Lookup(topo.lastAddr, le))
+      {
+        continue;
+      }
+      if (le.nextAddr == firstHop)
+      {
+        cur = topo.lastAddr;
+        reverseTail.push_back(cur);
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced)
+    {
+      break;
+    }
+  }
+
+  for (auto it = reverseTail.rbegin(); it != reverseTail.rend(); ++it)
+  {
+    if (*it != firstHop)
+    {
+      sequence.push_back(*it);
+    }
+  }
+  return sequence;
+}
+
+double
+RoutingProtocol::ComputeTrendPenalty(const MabArm& arm) const
+{
+  if (arm.rewardHistory.size() < 3)
+  {
+    return 0.0;
+  }
+  const std::size_t n = arm.rewardHistory.size();
+  const double trend = std::max(0.0, (arm.rewardHistory[n - 3] - arm.rewardHistory[n - 1]) / 2.0);
+  return (trend > 0.1) ? trend : 0.0;
+}
+
+double
+RoutingProtocol::ComputeSinrRisk(const Ipv4Address& nextHop) const
+{
+  auto it = m_linkState.find(nextHop);
+  if (it == m_linkState.end() || !it->second.hasSinr)
+  {
+    return 0.0;
+  }
+  if (it->second.smoothSinrDb < m_sinrThresholdDb)
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  return std::max(0.0, (m_sinrThresholdDb + 20.0 - it->second.smoothSinrDb) / 20.0);
+}
+
+void
+RoutingProtocol::ResetArmForNextHop(const Ipv4Address& nextHop)
+{
+  MabArm& arm = m_mabArms[nextHop];
+  arm.totalCount = 1;
+  arm.meanReward = 0.0;
+  arm.smoothedDelayMs = m_delayMaxMs;
+  arm.hasSmoothedDelay = false;
+  arm.rewardHistory.clear();
+  m_sigma[nextHop] = 0.0;
+}
+
+void
+RoutingProtocol::UpdateMabModel(const Ipv4Address& nextHop,
+                                bool isSuccess,
+                                double etxValue,
+                                double rawDelayMs,
+                                double sinrDb)
+{
+  MabArm& arm = m_mabArms[nextHop];
+
+  if (!arm.hasSmoothedDelay)
+  {
+    arm.smoothedDelayMs = rawDelayMs;
+    arm.hasSmoothedDelay = true;
+  }
+  else
+  {
+    arm.smoothedDelayMs =
+        m_delayEwmaAlpha * arm.smoothedDelayMs + (1.0 - m_delayEwmaAlpha) * rawDelayMs;
+  }
+  double sinrDbForReward = std::numeric_limits<double>::quiet_NaN();
+  if (std::isfinite(sinrDb))
+  {
+    auto& link = m_linkState[nextHop];
+    if (!link.hasSinr)
+    {
+      link.smoothSinrDb = sinrDb;
+      link.smoothRssiDbm = sinrDb;
+      link.hasSinr = true;
+    }
+    else
+    {
+      link.smoothSinrDb = m_sinrAlpha * link.smoothSinrDb + (1.0 - m_sinrAlpha) * sinrDb;
+    }
+    sinrDbForReward = link.smoothSinrDb;
+  }
+  else
+  {
+    auto it = m_linkState.find(nextHop);
+    if (it != m_linkState.end() && it->second.hasSinr)
+    {
+      sinrDbForReward = it->second.smoothSinrDb;
+    }
+  }
+
+  const double successTerm = isSuccess ? 1.0 : 0.0;
+  const double normDelay =
+      std::max(0.0, 1.0 - (arm.smoothedDelayMs / std::max(1.0, m_maxAllowedDelayMs)));
+  const double sinrLinear =
+      std::isfinite(sinrDbForReward) ? std::pow(10.0, sinrDbForReward / 10.0) : 0.0;
+  const double normSinr = std::min(1.0, sinrLinear / std::max(1e-9, m_targetSinr));
+  const double etxTerm = 1.0 / std::max(1.0, etxValue);
+
+  // Normalize weights to avoid "arbitrary tuning" criticism.
+  double a = m_rewardAlpha;
+  double b = m_rewardBeta;
+  double g = m_rewardGamma;
+  double d = m_rewardDeltaEtx;
+  const double sum = a + b + g + d;
+  if (sum > 0.0)
+  {
+    a /= sum;
+    b /= sum;
+    g /= sum;
+    d /= sum;
+  }
+  const double reward = a * successTerm + b * normDelay + g * normSinr + d * etxTerm;
+
+  arm.totalCount++;
+  const double previousMean = arm.meanReward;
+  arm.meanReward = (1.0 - m_rewardEwmaAlpha) * arm.meanReward + m_rewardEwmaAlpha * reward;
+  const double error = reward - previousMean;
+  const double previousSigma = m_sigma[nextHop];
+  m_sigma[nextHop] =
+      (1.0 - m_rewardEwmaAlpha) * previousSigma + m_rewardEwmaAlpha * error * error;
+  arm.rewardHistory.push_back(reward);
+  if (arm.rewardHistory.size() > 5)
+  {
+    arm.rewardHistory.pop_front();
+  }
 }
 
 void
@@ -2450,9 +3029,50 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
   RoutingTableEntry entry1;
   RoutingTableEntry entry2;
   CandidateRoute chosen;
+  uint32_t selectedPathIndex = 0;
   bool found = false;
+  if (m_enableSmartPath)
+  {
+    auto ctIt = m_candidateTable.find(header.GetDestination());
+    if (ctIt != m_candidateTable.end())
+    {
+      std::set<Ipv4Address> uniqueNextHops;
+      for (const auto& cand : ctIt->second)
+      {
+        if (cand.nextHop != Ipv4Address())
+        {
+          uniqueNextHops.insert(cand.nextHop);
+        }
+      }
 
-  if (ChooseCandidate(header.GetDestination(), chosen))
+      if (uniqueNextHops.size() > 1)
+      {
+        const Ipv4Address smartHop = SmartPathSelect(header.GetDestination());
+        if (smartHop != Ipv4Address::GetZero())
+        {
+          for (uint32_t k = 0; k < ctIt->second.size(); ++k)
+          {
+            if (ctIt->second[k].nextHop == smartHop)
+            {
+              chosen = ctIt->second[k];
+              selectedPathIndex = k;
+              found = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (p)
+  {
+    MyRouteTag routeTag;
+    routeTag.SetPathId(0);
+    routeTag.SetTimestamp(Simulator::Now());
+    p->ReplacePacketTag(routeTag);
+  }
+
+  if (found || ChooseCandidate(header.GetDestination(), chosen, selectedPathIndex))
   {
     uint32_t interfaceIdx = chosen.interface;
     if (interfaceIdx >= m_ipv4->GetNInterfaces())
@@ -2499,6 +3119,18 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
     rtentry->SetSource(ifAddr.GetLocal());
     rtentry->SetGateway(chosen.nextHop);
     rtentry->SetOutputDevice(m_ipv4->GetNetDevice(interfaceIdx));
+    if (!FastLinkFailureDetection(chosen.nextHop, true))
+    {
+      sockerr = Socket::ERROR_NOROUTETOHOST;
+      return nullptr;
+    }
+    if (p)
+    {
+      MyRouteTag routeTag;
+      routeTag.SetPathId(selectedPathIndex);
+      routeTag.SetTimestamp(Simulator::Now());
+      p->ReplacePacketTag(routeTag);
+    }
     sockerr = Socket::ERROR_NOTERROR;
     found = true;
   }
@@ -2534,6 +3166,11 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
     rtentry->SetSource(ifAddr.GetLocal());
     rtentry->SetGateway(entry2.nextAddr);
     rtentry->SetOutputDevice(m_ipv4->GetNetDevice(interfaceIdx));
+    if (!FastLinkFailureDetection(entry2.nextAddr, true))
+    {
+      sockerr = Socket::ERROR_NOROUTETOHOST;
+      return nullptr;
+    }
     sockerr = Socket::ERROR_NOTERROR;
     found = true;
   }
@@ -2591,52 +3228,14 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
   Ptr<Ipv4Route> rtentry;
   RoutingTableEntry entry1;
   RoutingTableEntry entry2;
-  CandidateRoute chosen;
-
-  if (ChooseCandidate(header.GetDestination(), chosen))
+  double measuredDelayMs = 0.0;
+  MyRouteTag inTag;
+  if (p && p->PeekPacketTag(inTag))
   {
-    uint32_t interfaceIdx = chosen.interface;
-    if (interfaceIdx >= m_ipv4->GetNInterfaces())
-    {
-      if (Lookup(header.GetDestination(), entry1))
-      {
-        bool foundSendEntry = FindSendEntry(entry1, entry2);
-        if (!foundSendEntry)
-        {
-          NS_FATAL_ERROR("FindSendEntry failure");
-        }
-        interfaceIdx = entry2.interface;
-        chosen.nextHop = entry2.nextAddr;
-      }
-      else
-      {
-        return false;
-      }
-    }
-
-    rtentry = Create<Ipv4Route>();
-    rtentry->SetDestination(header.GetDestination());
-
-    NS_ASSERT(m_ipv4);
-    uint32_t numOifAddresses = m_ipv4->GetNAddresses(interfaceIdx);
-    NS_ASSERT(numOifAddresses > 0);
-    Ipv4InterfaceAddress ifAddr;
-    if (numOifAddresses == 1)
-    {
-      ifAddr = m_ipv4->GetAddress(interfaceIdx, 0);
-    }
-    else
-    {
-      NS_FATAL_ERROR("XXX Not implemented yet: IP aliasing and ETX-OLSR");
-    }
-
-    rtentry->SetSource(ifAddr.GetLocal());
-    rtentry->SetGateway(chosen.nextHop);
-    rtentry->SetOutputDevice(m_ipv4->GetNetDevice(interfaceIdx));
-    ucb(rtentry, p, header);
-    return true;
+    measuredDelayMs = (Simulator::Now() - inTag.GetTimestamp()).GetMilliSeconds();
   }
-  else if (Lookup(header.GetDestination(), entry1))
+
+  if (Lookup(header.GetDestination(), entry1))
   {
     bool foundSendEntry = FindSendEntry(entry1, entry2);
     if (!foundSendEntry)
@@ -2644,10 +3243,10 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
       NS_FATAL_ERROR("FindSendEntry failure");
     }
 
+    uint32_t interfaceIdx = entry2.interface;
     rtentry = Create<Ipv4Route>();
     rtentry->SetDestination(header.GetDestination());
 
-    uint32_t interfaceIdx = entry2.interface;
     NS_ASSERT(m_ipv4);
     uint32_t numOifAddresses = m_ipv4->GetNAddresses(interfaceIdx);
     NS_ASSERT(numOifAddresses > 0);
@@ -2664,8 +3263,30 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
     rtentry->SetSource(ifAddr.GetLocal());
     rtentry->SetGateway(entry2.nextAddr);
     rtentry->SetOutputDevice(m_ipv4->GetNetDevice(interfaceIdx));
-
-    ucb(rtentry, p, header);
+    if (!FastLinkFailureDetection(entry2.nextAddr, true))
+    {
+      LinkLayerFeedbackHandler(entry2.nextAddr, false);
+      return false;
+    }
+    Ptr<Packet> forwardedPacket = p->Copy();
+    MyRouteTag outTag;
+    outTag = inTag;
+    if (measuredDelayMs <= 0.0)
+    {
+      outTag.SetTimestamp(Simulator::Now());
+    }
+    forwardedPacket->ReplacePacketTag(outTag);
+    ucb(rtentry, forwardedPacket, header);
+    SendBufferedPackets(header.GetDestination(), rtentry);
+    if (measuredDelayMs > 0.0)
+    {
+      TraceRTTUpdate(entry2.nextAddr, MilliSeconds(measuredDelayMs));
+      UpdateMabModel(entry2.nextAddr,
+                     true,
+                     GetLinkEtx(entry2.nextAddr),
+                     measuredDelayMs,
+                     std::numeric_limits<double>::quiet_NaN());
+    }
     return true;
   }
   else
@@ -2675,13 +3296,364 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
       return true;
     }
   }
+  if (EnqueueBufferedPacket(p, header, ucb, ecb))
+  {
+    NS_LOG_DEBUG("ETX-OLSR micro queue: buffered packet for destination " << header.GetDestination()
+                                                                           << ", queue-size="
+                                                                           << m_packetQueue.size());
+    return true;
+  }
   return false;
 }
 
-void RoutingProtocol::NotifyInterfaceUp(uint32_t) {}
-void RoutingProtocol::NotifyInterfaceDown(uint32_t) {}
+void
+RoutingProtocol::NotifyInterfaceUp(uint32_t interface)
+{
+  if (!m_ipv4 || interface >= m_ipv4->GetNInterfaces())
+  {
+    return;
+  }
+
+  Ptr<NetDevice> device = m_ipv4->GetNetDevice(interface);
+  Ptr<WifiNetDevice> wifiDevice = DynamicCast<WifiNetDevice>(device);
+  if (!wifiDevice)
+  {
+    return;
+  }
+
+  SetupRttTracer(device);
+
+  Ptr<WifiPhy> phy = wifiDevice->GetPhy();
+  if (!phy || m_wifiPhys.count(interface) > 0)
+  {
+    return;
+  }
+
+  m_wifiPhys[interface] = phy;
+  std::ostringstream path;
+  path << "/NodeList/" << GetObject<Node>()->GetId() << "/DeviceList/" << interface
+       << "/$ns3::WifiNetDevice/Phy/MonitorSnifferRx";
+  Config::ConnectWithoutContext(path.str(),
+                                MakeCallback(&RoutingProtocol::NotifyMonitorSnifferRx, this));
+}
+
+void
+RoutingProtocol::SetupRttTracer(Ptr<NetDevice> device)
+{
+  if (!device)
+  {
+    return;
+  }
+
+  NS_LOG_INFO("RTT sensor armed on device " << device->GetIfIndex());
+  if (m_ipv4)
+  {
+    const int32_t ifIndex = m_ipv4->GetInterfaceForDevice(device);
+    if (ifIndex >= 0)
+    {
+      std::ostringstream path;
+      path << "/NodeList/" << GetObject<Node>()->GetId() << "/DeviceList/" << ifIndex
+           << "/$ns3::WifiNetDevice/Mac/MacTxDrop";
+      Config::ConnectWithoutContext(path.str(),
+                                    MakeCallback(&RoutingProtocol::NotifyMacTxDrop, this));
+    }
+  }
+  // ns-3.45 note:
+  // Wifi MAC/PHY traces are good for observability but do not expose true per-neighbor RTT directly.
+  // We therefore use packet timestamp feedback in RouteInput (TraceRTTUpdate) as the RTT-like signal.
+}
+
+void
+RoutingProtocol::NotifyInterfaceDown(uint32_t interface)
+{
+  m_wifiPhys.erase(interface);
+}
 void RoutingProtocol::NotifyAddAddress(uint32_t, Ipv4InterfaceAddress) {}
 void RoutingProtocol::NotifyRemoveAddress(uint32_t, Ipv4InterfaceAddress) {}
+
+void
+RoutingProtocol::NotifyMonitorSnifferRx(Ptr<const Packet> packet,
+                                        uint16_t,
+                                        WifiTxVector,
+                                        MpduInfo,
+                                        SignalNoiseDbm signalNoise,
+                                        uint16_t)
+{
+  WifiMacHeader hdr;
+  Ptr<Packet> copy = packet->Copy();
+  if (!copy->PeekHeader(hdr))
+  {
+    return;
+  }
+
+  const Ipv4Address sender = ResolveIpv4FromMac(hdr.GetAddr2());
+  if (sender == Ipv4Address())
+  {
+    return;
+  }
+
+  const double sinrDb = signalNoise.signal - signalNoise.noise;
+  auto& state = m_linkState[sender];
+  if (!state.hasSinr)
+  {
+    state.smoothSinrDb = sinrDb;
+    state.smoothRssiDbm = signalNoise.signal;
+    state.hasSinr = true;
+    state.prevSinrDb = sinrDb;
+    state.hasPrevSinr = true;
+    state.smoothSinrDeltaDb = 0.0;
+  }
+  else
+  {
+    if (state.hasPrevSinr)
+    {
+      const double absDelta = std::abs(sinrDb - state.prevSinrDb);
+      // Reuse m_sinrAlpha as the smoothing factor for SINR-delta observability.
+      state.smoothSinrDeltaDb =
+          m_sinrAlpha * state.smoothSinrDeltaDb + (1.0 - m_sinrAlpha) * absDelta;
+    }
+    state.prevSinrDb = sinrDb;
+    state.hasPrevSinr = true;
+    state.smoothSinrDb = m_sinrAlpha * state.smoothSinrDb + (1.0 - m_sinrAlpha) * sinrDb;
+    state.smoothRssiDbm =
+        m_sinrAlpha * state.smoothRssiDbm + (1.0 - m_sinrAlpha) * signalNoise.signal;
+  }
+}
+
+void
+RoutingProtocol::TraceRTTUpdate(Ipv4Address neighAddr, Time newRtt)
+{
+  auto it = m_neighRealTimeRtt.find(neighAddr);
+  const Time oldRtt = (it == m_neighRealTimeRtt.end()) ? Time(0) : it->second;
+  const bool firstSample = oldRtt.IsZero();
+  const int64_t deltaUs = firstSample ? 0 : (newRtt.GetMicroSeconds() - oldRtt.GetMicroSeconds());
+
+  m_neighRealTimeRtt[neighAddr] = newRtt;
+  m_lastRttDelta[neighAddr] = deltaUs;
+  if (deltaUs > 0)
+  {
+    m_positiveDeltaStreak[neighAddr]++;
+  }
+  else
+  {
+    m_positiveDeltaStreak[neighAddr] = 0;
+  }
+
+  if (firstSample)
+  {
+    NS_LOG_DEBUG("RTT sensor init neigh=" << neighAddr << " rtt=" << newRtt.GetMilliSeconds() << "ms");
+    return;
+  }
+
+  if (deltaUs > 5000 && m_positiveDeltaStreak[neighAddr] >= 3)
+  {
+    NS_LOG_DEBUG("RTT sensor degradation neigh=" << neighAddr
+                                                 << " old=" << oldRtt.GetMilliSeconds()
+                                                 << "ms new=" << newRtt.GetMilliSeconds()
+                                                 << "ms deltaUs=" << deltaUs);
+  }
+}
+
+Ipv4Address
+RoutingProtocol::SmartPathSelect(Ipv4Address dest)
+{
+  auto it = m_candidateTable.find(dest);
+  if (it == m_candidateTable.end())
+  {
+    NS_LOG_DEBUG("SmartPathSelect: no candidate for " << dest);
+    return Ipv4Address::GetZero();
+  }
+
+  double bestScore = std::numeric_limits<double>::infinity();
+  Ipv4Address bestHop = Ipv4Address::GetZero();
+  for (const auto& cand : it->second)
+  {
+    if (cand.nextHop != Ipv4Address())
+    {
+      const auto rttIt = m_neighRealTimeRtt.find(cand.nextHop);
+      const double rttMs = (rttIt == m_neighRealTimeRtt.end()) ? 0.0 : rttIt->second.GetMilliSeconds();
+
+      const auto deltaIt = m_lastRttDelta.find(cand.nextHop);
+      const double deltaMs = (deltaIt == m_lastRttDelta.end()) ? 0.0 : (deltaIt->second / 1000.0);
+
+      const double score = cand.ctrlCost + rttMs + 3.0 * std::max(0.0, deltaMs);
+      if (score < bestScore)
+      {
+        bestScore = score;
+        bestHop = cand.nextHop;
+      }
+    }
+  }
+
+  if (bestHop != Ipv4Address::GetZero())
+  {
+    NS_LOG_DEBUG("SmartPathSelect: dest=" << dest << " nextHop=" << bestHop << " score=" << bestScore);
+  }
+  return bestHop;
+}
+
+void
+RoutingProtocol::NotifyMacTxDrop(Ptr<const Packet> packet)
+{
+  if (!packet)
+  {
+    return;
+  }
+
+  WifiMacHeader hdr;
+  Ptr<Packet> copy = packet->Copy();
+  if (!copy->PeekHeader(hdr))
+  {
+    return;
+  }
+
+  const Ipv4Address neigh = ResolveIpv4FromMac(hdr.GetAddr1());
+  if (neigh == Ipv4Address())
+  {
+    return;
+  }
+
+  // A drop spike is treated as immediate degradation evidence.
+  m_positiveDeltaStreak[neigh] = std::max(m_positiveDeltaStreak[neigh], 3u);
+  m_macTxDropEvents[neigh].push_back(Simulator::Now());
+  NS_LOG_DEBUG("MacTxDrop observed for neigh=" << neigh);
+}
+
+void
+RoutingProtocol::ClearNeighborTelemetry(Ipv4Address neighAddr)
+{
+  m_neighRealTimeRtt.erase(neighAddr);
+  m_lastRttDelta.erase(neighAddr);
+  m_positiveDeltaStreak.erase(neighAddr);
+  m_macTxDropEvents.erase(neighAddr);
+}
+
+void
+RoutingProtocol::PruneDropEvents(Ipv4Address neighAddr, double windowSec)
+{
+  if (windowSec <= 0.0)
+  {
+    return;
+  }
+  auto it = m_macTxDropEvents.find(neighAddr);
+  if (it == m_macTxDropEvents.end())
+  {
+    return;
+  }
+  auto& dq = it->second;
+  const Time now = Simulator::Now();
+  const Time win = Seconds(windowSec);
+  while (!dq.empty() && (now - dq.front()) > win)
+  {
+    dq.pop_front();
+  }
+}
+
+uint8_t
+RoutingProtocol::GetNeighborLabels(Ipv4Address neighAddr) const
+{
+  uint8_t labels = LABEL_NONE;
+  const Time now = Simulator::Now();
+
+  // FAST: RTT below threshold (if available).
+  auto rttIt = m_neighRealTimeRtt.find(neighAddr);
+  if (rttIt != m_neighRealTimeRtt.end() && rttIt->second.IsStrictlyPositive() &&
+      rttIt->second.GetMilliSeconds() <= m_fastRttMs)
+  {
+    labels |= LABEL_FAST;
+  }
+
+  // NOISY: low SINR, high SINR fluctuation, or recent MAC drops.
+  bool noisy = false;
+  auto lsIt = m_linkState.find(neighAddr);
+  if (lsIt != m_linkState.end() && lsIt->second.hasSinr)
+  {
+    if (lsIt->second.smoothSinrDb < m_noisySinrDb)
+    {
+      noisy = true;
+    }
+  }
+
+  // Recent drops are treated as "Noisy" evidence.
+  auto dropIt = m_macTxDropEvents.find(neighAddr);
+  bool hasRecentNoisyDrops = false;
+  bool hasRecentStableDrops = false;
+  if (dropIt != m_macTxDropEvents.end() && !dropIt->second.empty())
+  {
+    const Time lastDrop = dropIt->second.back();
+    if (m_noisyDropWindowSec > 0.0 && (now - lastDrop) <= Seconds(m_noisyDropWindowSec))
+    {
+      hasRecentNoisyDrops = true;
+    }
+    if (m_stableWindowSec > 0.0 && (now - lastDrop) <= Seconds(m_stableWindowSec))
+    {
+      hasRecentStableDrops = true;
+    }
+  }
+  if (hasRecentNoisyDrops)
+  {
+    noisy = true;
+  }
+
+  if (noisy)
+  {
+    labels |= LABEL_NOISY;
+  }
+
+  // STABLE: no drops recently + low SINR fluctuation (and not noisy).
+  bool stable = false;
+  if (!noisy)
+  {
+    double sinrDelta = 0.0;
+    bool hasSinr = false;
+    if (lsIt != m_linkState.end() && lsIt->second.hasSinr)
+    {
+      hasSinr = true;
+      sinrDelta = lsIt->second.smoothSinrDeltaDb;
+    }
+    if (!hasRecentStableDrops && hasSinr && sinrDelta <= m_stableSinrDeltaDb)
+    {
+      stable = true;
+    }
+  }
+  if (stable)
+  {
+    labels |= LABEL_STABLE;
+  }
+
+  return labels;
+}
+
+Ipv4Address
+RoutingProtocol::ResolveIpv4FromMac(const Address& mac) const
+{
+  for (auto nodeIt = NodeList::Begin(); nodeIt != NodeList::End(); ++nodeIt)
+  {
+    Ptr<Node> node = *nodeIt;
+    for (uint32_t i = 0; i < node->GetNDevices(); ++i)
+    {
+      Ptr<NetDevice> dev = node->GetDevice(i);
+      if (dev->GetAddress() != mac)
+      {
+        continue;
+      }
+
+      Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+      if (!ipv4)
+      {
+        return Ipv4Address();
+      }
+
+      int32_t ifIndex = ipv4->GetInterfaceForDevice(dev);
+      if (ifIndex < 0 || ipv4->GetNAddresses(static_cast<uint32_t>(ifIndex)) == 0)
+      {
+        return Ipv4Address();
+      }
+      return ipv4->GetAddress(static_cast<uint32_t>(ifIndex), 0).GetLocal();
+    }
+  }
+  return Ipv4Address();
+}
 
 std::vector<RoutingTableEntry>
 RoutingProtocol::GetRoutingTableEntries() const
