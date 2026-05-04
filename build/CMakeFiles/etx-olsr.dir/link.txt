@@ -1,0 +1,2 @@
+/usr/bin/ar qc libetx-olsr.a "CMakeFiles/etx-olsr.dir/model/etx-olsr-routing-protocol.cc.o" "CMakeFiles/etx-olsr.dir/model/control-agent.cc.o" "CMakeFiles/etx-olsr.dir/helper/etx-olsr-helper.cc.o" "CMakeFiles/etx-olsr.dir/helper/control-agent-helper.cc.o"
+/usr/bin/ranlib libetx-olsr.a

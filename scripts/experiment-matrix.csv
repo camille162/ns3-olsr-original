@@ -1,0 +1,14 @@
+experiment_id,milestone,scenario,routing,enableControlAgent,enableJammer,uavCount,stopTime,seed,run,notes
+GUIDE-ETX-FAIR,M1+M2,Guide thresholds + kill-chain UDP 6100/6200,etx,fair(0 if supported),1,50,120,1,1,See stdout GUIDE_* lines; rebuild sim for all CLI flags
+GUIDE-OLSR,M1+M2,Guide thresholds + kill-chain,olsr,n/a,1,50,120,1,1,Compare routing vs ETX
+SMOKE-ETX,smoke,Quick sanity,etx,0,0,20,15,1,1,Dev machine / CI smoke test
+SMOKE-OLSR,smoke,Quick sanity,olsr,n/a,0,20,15,1,1,Compare routing boots
+M1-ETX-FAIR,M1,Protocol baseline (fair),etx,0,1,50,120,1,1,No ControlAgent; fair vs OLSR
+M1-OLSR-FAIR,M1,Protocol baseline (fair),olsr,n/a,1,50,120,1,1,Stock OLSR same conditions
+M1-ETX-FULL,M1,Full adaptive stack,etx,1,1,50,120,1,1,ETX + ControlAgent (project demo)
+M1-ETX-FAIR-S2,M1,Repeatability,etx,0,1,50,120,2,1,Second RNG seed
+M1-ETX-FAIR-S3,M1,Repeatability,etx,0,1,50,120,3,1,Third RNG seed
+M2-ETX-RES,M2,Resilience + jamming,etx,0,1,50,180,1,2,Longer sim; different run id for flows/failures
+M2-OLSR-RES,M2,Resilience + jamming,olsr,n/a,1,50,180,1,2,Same as M2-ETX-RES for contrast
+M2-CLEAN-ETX,M2,No jammer (routing stress only),etx,0,0,50,120,1,1,Isolate routing from jammer
+CAL-LITE,M1,Low RAM preset,etx,0,1,30,60,1,1,If 50 nodes freezes host

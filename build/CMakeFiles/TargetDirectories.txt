@@ -1,0 +1,4 @@
+/home/wm/etx-olsr/build/CMakeFiles/etx-olsr.dir
+/home/wm/etx-olsr/build/CMakeFiles/sim.dir
+/home/wm/etx-olsr/build/CMakeFiles/edit_cache.dir
+/home/wm/etx-olsr/build/CMakeFiles/rebuild_cache.dir
