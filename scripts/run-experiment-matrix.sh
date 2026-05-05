@@ -13,6 +13,9 @@
 # Rebuild note: if ./sim --PrintHelp has no failureFraction / enableKillChainFlows, copy this
 # repository's src/main.cc into your ns-3 project and recompile to get GUIDE_* lines.
 #
+# nohup: put env before bash (otherwise SIM= is wrong and you get exit 127):
+#   nohup env SIM="${PWD}/sim" bash ../scripts/run-experiment-matrix.sh guide > guide.log 2>&1 &
+#
 # Crash / freeze resilience tips:
 #   - Run inside tmux or screen so SSH disconnect does not kill the job
 #   - Point SESSION_ROOT to a persistent disk (not tmpfs)

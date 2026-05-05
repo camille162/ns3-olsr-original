@@ -6,13 +6,20 @@
 
 #include "etx-olsr-helper.h"
 
-#include "ns3/etx-olsr-routing-protocol.h"
+#include "etx-olsr-routing-protocol.h"
+
+#include "ns3/assert.h"
 #include "ns3/ipv4-list-routing.h"
 #include "ns3/ipv4.h"
+#include "ns3/log.h"
 #include "ns3/node.h"
+#include "ns3/pointer.h"
+#include "ns3/simulator.h"
 
 namespace ns3
 {
+
+NS_LOG_COMPONENT_DEFINE("EtxOlsrHelper");
 
 EtxOlsrHelper::EtxOlsrHelper()
 {
@@ -28,8 +35,11 @@ EtxOlsrHelper::Copy() const
 Ptr<Ipv4RoutingProtocol>
 EtxOlsrHelper::Create(Ptr<Node> node) const
 {
-    Ptr<etxolsr::RoutingProtocol> agent =
-        m_agentFactory.Create<etxolsr::RoutingProtocol>();
+    Ptr<etxolsr::RoutingProtocol> agent = m_agentFactory.Create<etxolsr::RoutingProtocol>();
+    // Do not call SetIpv4 here: InternetStackHelper::Install binds Ipv4 via
+    // Ipv4L3Protocol::SetRoutingProtocol -> Ipv4ListRouting::SetIpv4 -> SetIpv4 on each entry.
+    // Calling SetIpv4 twice causes Ipv4StaticRouting (HNA table) to assert (!m_ipv4 && ipv4).
+    NS_ASSERT_MSG(node, "EtxOlsrHelper::Create: null node");
     node->AggregateObject(agent);
     return agent;
 }
@@ -46,27 +56,23 @@ EtxOlsrHelper::AssignStreams(NodeContainer c, int64_t stream)
     int64_t currentStream = stream;
     for (auto i = c.Begin(); i != c.End(); ++i)
     {
-        Ptr<Node> node = *i;
-        Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+        Ptr<Ipv4> ipv4 = (*i)->GetObject<Ipv4>();
         NS_ASSERT_MSG(ipv4, "EtxOlsrHelper::AssignStreams: no Ipv4 on node");
-        Ptr<Ipv4RoutingProtocol> proto = ipv4->GetRoutingProtocol();
-        Ptr<etxolsr::RoutingProtocol> etxOlsr =
-            DynamicCast<etxolsr::RoutingProtocol>(proto);
+        Ptr<Ipv4RoutingProtocol> rp = ipv4->GetRoutingProtocol();
+        Ptr<etxolsr::RoutingProtocol> etxOlsr = DynamicCast<etxolsr::RoutingProtocol>(rp);
         if (etxOlsr)
         {
             currentStream += etxOlsr->AssignStreams(currentStream);
             continue;
         }
-        // Check if it's wrapped in a list routing
-        Ptr<Ipv4ListRouting> list = DynamicCast<Ipv4ListRouting>(proto);
-        if (list)
+        Ptr<Ipv4ListRouting> lrp = DynamicCast<Ipv4ListRouting>(rp);
+        if (lrp)
         {
-            int16_t priority;
-            for (uint32_t j = 0; j < list->GetNRoutingProtocols(); j++)
+            for (uint32_t j = 0; j < lrp->GetNRoutingProtocols(); ++j)
             {
-                Ptr<Ipv4RoutingProtocol> listProto = list->GetRoutingProtocol(j, priority);
-                Ptr<etxolsr::RoutingProtocol> listEtxOlsr =
-                    DynamicCast<etxolsr::RoutingProtocol>(listProto);
+                int16_t priority = 0;
+                Ptr<Ipv4RoutingProtocol> sub = lrp->GetRoutingProtocol(j, priority);
+                Ptr<etxolsr::RoutingProtocol> listEtxOlsr = DynamicCast<etxolsr::RoutingProtocol>(sub);
                 if (listEtxOlsr)
                 {
                     currentStream += listEtxOlsr->AssignStreams(currentStream);
@@ -75,7 +81,7 @@ EtxOlsrHelper::AssignStreams(NodeContainer c, int64_t stream)
             }
         }
     }
-    return (currentStream - stream);
+    return currentStream - stream;
 }
 
 } // namespace ns3

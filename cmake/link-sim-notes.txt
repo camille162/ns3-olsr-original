@@ -1,0 +1,39 @@
+Fix: undefined reference to ns3::ControlAgentHelper::...
+
+Cause
+-----
+The executable `sim` links main.cc but does not link the static library built from the
+etx-olsr contrib module (which contains control-agent-helper.cc and control-agent.cc).
+
+Also verify src/etx-olsr/CMakeLists.txt lists:
+  helper/control-agent-helper.cc
+  model/control-agent.cc
+
+CMake (example)
+---------------
+After add_executable(sim ...):
+
+  target_link_libraries(sim PRIVATE etx-olsr)
+
+The exact CMake target name may be etx-olsr, ns3-etx-olsr, or libetx-olsr depending on
+your ns-3 version / wrapper. From ~/etx-olsr/build run:
+
+  grep -r etx-olsr CMakeFiles/*.cmake 2>/dev/null | head
+
+or open build/build.ninja and search for etx-olsr.
+
+If your project uses ns3_create_executable() from ns3 CMake helpers, pass the module in
+the LIBS_TO_LINK argument for that contrib module.
+
+Quick check
+-----------
+After fixing CMake, rebuild etx-olsr then sim:
+
+  cmake --build . --target etx-olsr
+  cmake --build . --target sim
+
+Verify symbols:
+
+  nm -C libetx-olsr.a 2>/dev/null | grep ControlAgentHelper | head
+
+(or the .a path shown in your link command)

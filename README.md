@@ -1,13 +1,25 @@
 # ns3-olsr-original
-find where to change
+
+单一 contrib 模块 **`etx-olsr`**（不再单独维护 `src/olsr`）：RFC 报文状态与 hop-count 实现在带 `etx-olsr-` 前缀的源文件中；运行时类型仍为 `ns3::olsr::PacketHeader` / `ns3::olsr::RoutingProtocol`（基线）与 `ns3::etxolsr::RoutingProtocol`（ETX 扩展）。
+
+**注意：** 若完整 ns-3 树里仍启用官方内置的 `src/olsr` 模块，会与这里的 `ns3::olsr::*` 实现重复链接；集成时请关闭其一（通常只保留本 contrib）。
+
+```
 src/etx-olsr/
-├── CMakeLists.txt                          ✅ 已有
+├── CMakeLists.txt
 ├── helper/
-│   ├── etx-olsr-helper.h                  ✅ 已有
-│   └── etx-olsr-helper.cc                 ✅ 本次新增（之前缺失）
+│   ├── etx-olsr-helper.{h,cc}           # 安装 ETX 扩展协议
+│   ├── etx-olsr-hopcount-helper.{h,cc}   # 安装 hop-count OLSR（原 OlsrHelper）
+│   └── control-agent-helper.{h,cc}
 └── model/
-    ├── etx-olsr-routing-protocol.h        ✅ 已有
-    └── etx-olsr-routing-protocol.cc       ✅ 已有
+    ├── etx-olsr-msg-header.{h,cc}        # HELLO/TC/… 报文（原 olsr-header）
+    ├── etx-olsr-repositories.h
+    ├── etx-olsr-state.{h,cc}
+    ├── etx-olsr-hopcount-routing-protocol.{h,cc}
+    ├── etx-olsr-routing-protocol.{h,cc}  # ETX 度量路由
+    ├── etx-tc-metric-trailer.{h,cc}
+    └── control-agent.{h,cc}
+```
 实现的功能：ETX-OLSR 路由协议
 这个模块在 ns-3 仿真平台上实现了 基于 ETX 链路质量度量的 OLSR 路由协议，是对标准 OLSR（RFC 3626）的优化改进。
 
@@ -51,3 +63,29 @@ InitialEtx	3.0	未知链路的初始 ETX 估计值
 HelloInterval	2s	HELLO 消息发送间隔
 TcInterval	5s	TC 消息发送间隔
 Willingness	DEFAULT	转发流量的意愿
+
+5. 分布式 ControlAgent（轻量控制面）
+- `model/control-agent.{h,cc}`：`ns3::etxolsr::ControlAgent` 应用，**每节点一个**，周期性读取本地 `CollectControlPlaneSignals()`（奖励方差、EWMA 时延、近 1 s 路径切换率），用规则调整 `MabC` 与 `SwitchPenalty`。
+- **平滑与记忆**：先由基线 + 规则得到 `targetMabC` / `targetSwitchPen`，再按 `SmoothingBeta`（默认 0.35）做 `out=(1-β)*当前+β*目标`，避免每秒从基线“失忆”重算；`ContinuousSigmaScaling=true`（默认）时在 `SigmaLow`～`SigmaHigh` 之间对 σ 连续插值调节探索强度，减少硬阈值跳变。
+- `helper/control-agent-helper.{h,cc}`：`ControlAgentHelper` 批量安装。
+- 仿真 `main.cc` 在 `routing==etx` 且 `enableControlAgent==true`（默认）时对所有 UAV 安装；关闭：`--enableControlAgent=false`。
+- 路由侧新增 API：`CollectControlPlaneSignals`、`SetAdaptiveHyperparameters`、`GetMabC` / `GetSwitchPenalty`。
+
+---
+
+## 6. 链接 `sim` 时出现 `undefined reference to ControlAgentHelper`
+
+`main.cc` 使用了 `ControlAgentHelper`，实现位于 `src/etx-olsr/helper/control-agent-helper.cc`（随 **`etx-olsr` 模块**一起编译进静态库）。若自定义 CMake 里 **`sim` 未链接该模块**，会在链接阶段报错。
+
+**处理：**
+
+1. 确认 `src/etx-olsr/CMakeLists.txt` 的 `SOURCE_FILES` 包含 `control-agent-helper.cc` 与 `control-agent.cc`（本仓库已包含）。
+2. 在定义 `sim` 的 `CMakeLists.txt` 里增加对模块库的链接，例如：
+
+```cmake
+target_link_libraries(sim PRIVATE etx-olsr)
+```
+
+具体目标名可能是 `etx-olsr`、`ns3-etx-olsr` 等，可在 `build` 目录搜索：`grep -r etx-olsr CMakeFiles/`。更细的说明见 `cmake/link-sim-notes.txt`。
+
+**不想改 CMake 的临时办法**：在 ns-3 里不要单独建 `sim` 目标，改用 `scratch` 或官方推荐方式把 `main.cc` 放进会 **自动链接已启用 contrib 模块** 的构建目标（取决于你的 ns-3 版本与目录布局）。
